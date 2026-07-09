@@ -320,15 +320,13 @@ MHD_Result handle_get_coverage_report(struct MHD_Connection* connection) {
 }
 
 MHD_Result handle_get_coverage_report_pdf(struct MHD_Connection* connection) {
-    // Matches the Go version's placeholder — real PDF generation would use
-    // the pdf skill / a PDF library; left as-is since the original was also
-    // just a placeholder byte stream, not real PDF generation.
+    // Placeholder: real PDF generation would use a PDF library.
+    // The original Go version was also a stub returning a placeholder byte stream.
+    // Use the shim pattern (set fields on MHD_Connection directly) instead of the
+    // raw libmicrohttpd response API which is not available in the libwebsockets shim.
     static const std::string placeholder = "PDF Generation Placeholder";
-    struct MHD_Response* response = MHD_create_response_from_buffer(
-        placeholder.size(), (void*)placeholder.c_str(), MHD_RESPMEM_MUST_COPY);
-    MHD_add_response_header(response, "Content-Type", "application/pdf");
-    MHD_add_response_header(response, "Content-Disposition", "attachment; filename=coverage_report.pdf");
-    MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
-    MHD_destroy_response(response);
-    return ret;
+    connection->content_type = "application/pdf";
+    connection->status = MHD_HTTP_OK;
+    connection->body = placeholder;
+    return MHD_YES;
 }
