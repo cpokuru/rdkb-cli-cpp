@@ -42,7 +42,7 @@ static int http_callback(struct lws* wsi, enum lws_callback_reasons reason,
         sd->uri = (qpos != std::string::npos) ? full_uri.substr(0, qpos) : full_uri;
 
         // Detect HTTP method using lws_http_get_uri_and_method() (lws 4.x+)
-        const char* m = nullptr;
+        char* m = nullptr;
         lws_http_get_uri_and_method(wsi, &m, nullptr);
         sd->method = (m && m[0] != '\0') ? m : "GET";
 
