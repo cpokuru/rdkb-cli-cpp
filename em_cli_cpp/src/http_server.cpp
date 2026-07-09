@@ -1,0 +1,475 @@
+#include "http_server.h"
+#include "app_state.h"
+#include "json_helpers.h"
+#include "em_cli_bridge.h"
+#include "handlers.h"
+#include <cstring>
+#include <cstdio>
+#include <regex>
+#include <fstream>
+#include <sstream>
+
+// Per-connection state while a request's body streams in across multiple
+// libmicrohttpd callback invocations. Go's net/http gives you a single
+// io.Reader for r.Body; libmicrohttpd calls the handler repeatedly with
+// chunks instead, so this plays the role Go's Request.Body played.
+struct ConnCtx {
+    std::string body;
+    bool processed = false;
+};
+
+static bool validate_ssid(const std::string& ssid);
+static bool validate_pass_phrase(const std::string& pass);
+
+// ===== Static file serving =====
+// The Go version's source hardcoded "/nvram/static/" for both
+// router.PathPrefix("/static/") -> http.FileServer and "/" -> serveIndex.
+// However, the actual deployed em_cli.service process runs with CWD
+// /usr/ccsp/EasyMesh (confirmed via /proc/<pid>/cwd on the live gateway),
+// and that's where the real static/ directory and JSON config files live
+// — so that's the path used here instead of the literal source hardcode.
+// If this ever needs to change again, it's this one constant.
+static const char* STATIC_ROOT = "/usr/ccsp/EasyMesh/static/";
+
+
+static const char* content_type_for_extension(const std::string& path) {
+    auto ends_with = [&](const char* suffix) {
+        size_t n = strlen(suffix);
+        return path.size() >= n && path.compare(path.size() - n, n, suffix) == 0;
+    };
+    if (ends_with(".html")) return "text/html";
+    if (ends_with(".js")) return "application/javascript";
+    if (ends_with(".css")) return "text/css";
+    if (ends_with(".json")) return "application/json";
+    if (ends_with(".svg")) return "image/svg+xml";
+    if (ends_with(".png")) return "image/png";
+    if (ends_with(".jpg") || ends_with(".jpeg")) return "image/jpeg";
+    if (ends_with(".ico")) return "image/x-icon";
+    if (ends_with(".woff2")) return "font/woff2";
+    if (ends_with(".woff")) return "font/woff";
+    return "application/octet-stream";
+}
+
+static MHD_Result serve_file(struct MHD_Connection* connection, const std::string& fs_path) {
+    std::ifstream in(fs_path, std::ios::binary);
+    if (!in.is_open()) {
+        CJsonPtr err(cJSON_CreateObject());
+        add_str(err.get(), "error", "Not found");
+        return send_json(connection, MHD_HTTP_NOT_FOUND, to_json_string(err.get()));
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    std::string content = ss.str();
+
+    struct MHD_Response* response = MHD_create_response_from_buffer(
+        content.size(), (void*)content.c_str(), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(response, "Content-Type", content_type_for_extension(fs_path));
+    MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
+    MHD_destroy_response(response);
+    return ret;
+}
+
+// Blocks any path containing ".." so /static/../../etc/passwd-style
+// requests can't escape the static root — Go's http.FileServer does this
+// kind of normalization internally; libmicrohttpd doesn't, so it's done
+// here explicitly.
+static bool path_is_safe(const std::string& rel_path) {
+    return rel_path.find("..") == std::string::npos;
+}
+
+MHD_Result send_json(struct MHD_Connection* connection, int status_code, const std::string& body) {
+    struct MHD_Response* response = MHD_create_response_from_buffer(
+        body.size(), (void*)body.c_str(), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(response, "Content-Type", "application/json");
+    // Matches the original Go corsMiddleware
+    MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+    MHD_add_response_header(response, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    MHD_add_response_header(response, "Access-Control-Allow-Headers", "Content-Type, Authorization");
+    MHD_Result ret = MHD_queue_response(connection, status_code, response);
+    MHD_destroy_response(response);
+    return ret;
+}
+
+// ===== Route handlers (equivalent to the *Handler funcs in main.go) =====
+
+static MHD_Result handle_get_devices(struct MHD_Connection* connection) {
+    auto& state = AppState::instance();
+    std::shared_lock lock(state.devices_mu);
+
+    int online = 0;
+    for (auto& d : state.devices) if (d.status == "Online") online++;
+
+    CJsonPtr root(cJSON_CreateObject());
+    cJSON* arr = cJSON_CreateArray();
+    for (auto& d : state.devices) cJSON_AddItemToArray(arr, device_to_json(d));
+    cJSON_AddItemToObject(root.get(), "devices", arr);
+    cJSON_AddNumberToObject(root.get(), "total", (double)state.devices.size());
+    cJSON_AddNumberToObject(root.get(), "online", online);
+    add_str(root.get(), "updated", epoch_to_rfc3339(now_epoch()));
+
+    return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
+}
+
+static MHD_Result handle_get_device(struct MHD_Connection* connection, const std::string& mac) {
+    auto& state = AppState::instance();
+    std::shared_lock lock(state.devices_mu);
+    for (auto& d : state.devices) {
+        if (d.mac == mac) {
+            CJsonPtr root(device_to_json(d));
+            return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
+        }
+    }
+    CJsonPtr err(cJSON_CreateObject());
+    add_str(err.get(), "error", "Device not found");
+    return send_json(connection, MHD_HTTP_NOT_FOUND, to_json_string(err.get()));
+}
+
+static MHD_Result handle_get_clients(struct MHD_Connection* connection) {
+    auto& state = AppState::instance();
+    std::shared_lock lock(state.clients_mu);
+
+    double now = now_epoch();
+    int active = 0;
+    for (auto& c : state.clients) if (now - c.last_activity < 300.0) active++;
+
+    CJsonPtr root(cJSON_CreateObject());
+    cJSON* arr = cJSON_CreateArray();
+    for (auto& c : state.clients) cJSON_AddItemToArray(arr, client_to_json(c));
+    cJSON_AddItemToObject(root.get(), "clients", arr);
+    cJSON_AddNumberToObject(root.get(), "total", (double)state.clients.size());
+    cJSON_AddNumberToObject(root.get(), "active", active);
+    add_str(root.get(), "updated", epoch_to_rfc3339(now));
+
+    return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
+}
+
+static MHD_Result handle_get_client(struct MHD_Connection* connection, const std::string& mac) {
+    auto& state = AppState::instance();
+    std::shared_lock lock(state.clients_mu);
+    for (auto& c : state.clients) {
+        if (c.mac == mac) {
+            CJsonPtr root(client_to_json(c));
+            return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
+        }
+    }
+    CJsonPtr err(cJSON_CreateObject());
+    add_str(err.get(), "error", "Client not found");
+    return send_json(connection, MHD_HTTP_NOT_FOUND, to_json_string(err.get()));
+}
+
+static int calculate_health_score() {
+    auto& state = AppState::instance();
+    std::shared_lock lock(state.devices_mu);
+    if (state.devices.empty()) return 0;
+    int online = 0;
+    for (auto& d : state.devices) if (d.status == "Online") online++;
+    return (online * 100) / (int)state.devices.size();
+}
+
+static MHD_Result handle_system_status(struct MHD_Connection* connection) {
+    auto& state = AppState::instance();
+
+    int online_devices = 0;
+    {
+        std::shared_lock lock(state.devices_mu);
+        for (auto& d : state.devices) if (d.status == "Online") online_devices++;
+    }
+
+    int active_clients = 0;
+    double now = now_epoch();
+    {
+        std::shared_lock lock(state.clients_mu);
+        for (auto& c : state.clients) if (now - c.last_activity < 300.0) active_clients++;
+    }
+
+    CJsonPtr root(cJSON_CreateObject());
+    add_str(root.get(), "controller", "running");
+    add_str(root.get(), "version", "EasyMesh R6 v1.0.0");
+    add_str(root.get(), "protocol", "IEEE 1905.1 + Multi-AP R6");
+    cJSON_AddNumberToObject(root.get(), "mesh_nodes", (double)state.devices.size());
+    cJSON_AddNumberToObject(root.get(), "online_nodes", online_devices);
+    cJSON_AddNumberToObject(root.get(), "active_clients", active_clients);
+    cJSON_AddNumberToObject(root.get(), "health_score", calculate_health_score());
+    add_str(root.get(), "timestamp", epoch_to_rfc3339(now));
+
+    cJSON* features = cJSON_CreateObject();
+    cJSON_AddBoolToObject(features, "wifi7_support", true);
+    cJSON_AddBoolToObject(features, "coordinated_scan", true);
+    cJSON_AddBoolToObject(features, "optimized_roaming", true);
+    cJSON_AddBoolToObject(features, "traffic_separation", true);
+    cJSON_AddBoolToObject(features, "advanced_security", true);
+    cJSON_AddBoolToObject(features, "ai_optimization", true);
+    cJSON_AddItemToObject(root.get(), "features", features);
+
+    return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
+}
+
+// ===== Wireless profiles (first handler wired to the real em_cli library) =====
+// Direct translation of getWirelessProfilesHandler from main.go. Notice
+// there's no C.CString/C.free anywhere — em::exec_cmd and em::get_child
+// take std::string and do the C-string handling internally, once.
+
+static MHD_Result handle_get_wireless_profiles(struct MHD_Connection* connection) {
+    em_network_node_t* ssid_tree = em::exec_cmd("get_ssid OneWifiMesh");
+    if (!ssid_tree) {
+        CJsonPtr err(cJSON_CreateObject());
+        add_str(err.get(), "error", "Failed to fetch ssid tree");
+        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
+    }
+
+    std::vector<HaulConfig> hauls = em::get_configured_hauls(ssid_tree);
+
+    CJsonPtr root(cJSON_CreateObject());
+    cJSON* arr = cJSON_CreateArray();
+    for (auto& h : hauls) cJSON_AddItemToArray(arr, haul_config_to_json(h));
+    cJSON_AddItemToObject(root.get(), "haulConfig", arr);
+    cJSON_AddNumberToObject(root.get(), "total", (double)hauls.size());
+
+    return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
+}
+
+static MHD_Result handle_post_wireless_profiles(struct MHD_Connection* connection, const std::string& body) {
+    CJsonPtr parsed(cJSON_Parse(body.c_str()));
+    if (!parsed || !cJSON_IsArray(parsed.get())) {
+        CJsonPtr err(cJSON_CreateObject());
+        add_str(err.get(), "error", "Invalid request payload");
+        return send_json(connection, MHD_HTTP_BAD_REQUEST, to_json_string(err.get()));
+    }
+
+    em_network_node_t* ssid_tree = em::exec_cmd("get_ssid OneWifiMesh");
+    if (!ssid_tree) {
+        CJsonPtr err(cJSON_CreateObject());
+        add_str(err.get(), "error", "Failed to fetch ssid tree");
+        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
+    }
+
+    int n = cJSON_GetArraySize(parsed.get());
+    for (int i = 0; i < n; i++) {
+        HaulConfig haul = haul_config_from_json(cJSON_GetArrayItem(parsed.get(), i));
+
+        if (!validate_ssid(haul.ssid)) {
+            CJsonPtr err(cJSON_CreateObject());
+            add_str(err.get(), "error", "Invalid SSID for " + haul.haul_type);
+            return send_json(connection, MHD_HTTP_BAD_REQUEST, to_json_string(err.get()));
+        }
+        if (!validate_pass_phrase(haul.pass_phrase)) {
+            CJsonPtr err(cJSON_CreateObject());
+            add_str(err.get(), "error", "Invalid PassPhrase for " + haul.haul_type);
+            return send_json(connection, MHD_HTTP_BAD_REQUEST, to_json_string(err.get()));
+        }
+        if (!em::update_network_ssid_list(ssid_tree, haul, true)) {
+            CJsonPtr err(cJSON_CreateObject());
+            add_str(err.get(), "error", "Update failed for " + haul.haul_type);
+            return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
+        }
+    }
+
+    if (!em::apply_network_name_config(ssid_tree)) {
+        CJsonPtr err(cJSON_CreateObject());
+        add_str(err.get(), "error", "Failed to update networkssid list");
+        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
+    }
+
+    CJsonPtr root(cJSON_CreateObject());
+    cJSON_AddBoolToObject(root.get(), "success", true);
+    add_str(root.get(), "message", "Profile updated successfully");
+    return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
+}
+
+// SSID/passphrase validation, matching validateSSID / validatePassPhrase in main.go.
+static bool validate_ssid(const std::string& ssid) {
+    if (ssid.empty() || ssid.size() > 32) return false;
+    static const std::regex re("^[\\w\\-. ]+$");
+    return std::regex_match(ssid, re);
+}
+static bool validate_pass_phrase(const std::string& pass) {
+    return pass.size() >= 8 && pass.size() <= 63;
+}
+
+// ===== Route table =====
+// Path params (e.g. {mac}) are matched with a light regex, same intent as
+// gorilla/mux's api.HandleFunc("/devices/{mac}", ...).
+
+static MHD_Result route(struct MHD_Connection* connection, const std::string& m,
+                         const std::string& path, const std::string& body) {
+    if (m == "OPTIONS") {
+        return send_json(connection, MHD_HTTP_OK, "{}");
+    }
+
+    std::smatch match;
+
+    // Static dashboard assets — matches Go's "/" -> serveIndex and
+    // "/static/" -> http.FileServer, both rooted at STATIC_ROOT.
+    if (m == "GET" && path == "/") {
+        return serve_file(connection, std::string(STATIC_ROOT) + "index.html");
+    }
+    if (m == "GET" && path.rfind("/static/", 0) == 0) {
+        std::string rel = path.substr(strlen("/static/"));
+        if (!path_is_safe(rel)) {
+            CJsonPtr err(cJSON_CreateObject());
+            add_str(err.get(), "error", "Invalid path");
+            return send_json(connection, MHD_HTTP_BAD_REQUEST, to_json_string(err.get()));
+        }
+        return serve_file(connection, std::string(STATIC_ROOT) + rel);
+    }
+
+    if (m == "GET" && path == "/api/v1/devices") return handle_get_devices(connection);
+    if (m == "GET" && path == "/api/v1/clients") return handle_get_clients(connection);
+    if (m == "GET" && path == "/api/v1/system/status") return handle_system_status(connection);
+    if (m == "GET" && path == "/api/v1/wireless/profiles") return handle_get_wireless_profiles(connection);
+    if (m == "POST" && path == "/api/v1/wireless/profiles") return handle_post_wireless_profiles(connection, body);
+
+    if (m == "GET" && std::regex_match(path, match, std::regex("^/api/v1/devices/([0-9A-Fa-f:]+)$")))
+        return handle_get_device(connection, match[1].str());
+
+    if (m == "GET" && std::regex_match(path, match, std::regex("^/api/v1/clients/([0-9A-Fa-f:]+)$")))
+        return handle_get_client(connection, match[1].str());
+
+    // ===== Device / client mutations =====
+    if (m == "POST" && std::regex_match(path, match, std::regex("^/api/v1/devices/([0-9A-Fa-f:]+)/reboot$")))
+        return handle_post_reboot_device(connection, match[1].str());
+    if (m == "POST" && std::regex_match(path, match, std::regex("^/api/v1/clients/([0-9A-Fa-f:]+)/disconnect$")))
+        return handle_post_disconnect_client(connection, match[1].str());
+    if (m == "POST" && std::regex_match(path, match, std::regex("^/api/v1/clients/([0-9A-Fa-f:]+)/block$")))
+        return handle_post_block_client(connection, match[1].str());
+    if (m == "POST" && std::regex_match(path, match, std::regex("^/api/v1/clients/([0-9A-Fa-f:]+)/unblock$")))
+        return handle_post_unblock_client(connection, match[1].str());
+
+    // ===== Controller IP =====
+    if (m == "GET" && path == "/api/v1/controllerIPConfig") return handle_get_controller_ip(connection);
+    if (m == "POST" && path == "/api/v1/controllerIPConfig") return handle_post_controller_ip(connection, body);
+
+    // ===== Wireless =====
+    if (m == "GET" && path == "/api/v1/wireless/radios") return handle_get_radios(connection);
+    if (m == "POST" && path == "/api/v1/wireless/radios") return handle_post_radios(connection, body);
+    if (m == "PUT" && std::regex_match(path, match, std::regex("^/api/v1/wireless/radios/([^/]+)$")))
+        return handle_put_radio(connection, match[1].str(), body);
+    if (m == "GET" && path == "/api/v1/wireless/advanced") return handle_get_advanced(connection);
+    if (m == "PUT" && path == "/api/v1/wireless/advanced") return handle_put_advanced(connection, body);
+    if (m == "POST" && path == "/api/v1/wireless/scan") return handle_post_scan(connection, body);
+    if (m == "GET" && path == "/api/v1/wireless/scan/results") return handle_get_scan_results(connection);
+    if (m == "GET" && path == "/api/v1/wireless/config") return handle_get_wireless_config(connection);
+    if (m == "PUT" && path == "/api/v1/wireless/config") return handle_put_wireless_config(connection, body);
+    if ((m == "GET" || m == "POST") && path == "/api/v1/wifipolicy")
+        return m == "GET" ? handle_get_wifi_policy(connection) : handle_post_wifi_policy(connection, body);
+    if ((m == "GET" || m == "POST") && path == "/api/v1/wifireset")
+        return m == "GET" ? handle_get_wifi_reset(connection) : handle_post_wifi_reset(connection, body);
+    if (m == "POST" && path == "/api/v1/unassoc_sta_query") return handle_post_unassoc_sta_query(connection, body);
+
+    // ===== Coverage / placement =====
+    if (m == "GET" && path == "/api/v1/coverage/analysis") return handle_get_coverage_analysis(connection);
+    if (m == "POST" && path == "/api/v1/coverage/analyze") return handle_post_coverage_analyze(connection, body);
+    if (m == "POST" && path == "/api/v1/coverage/optimize") return handle_post_coverage_optimize(connection, body);
+    if (m == "GET" && path == "/api/v1/coverage/floorplans") return handle_get_floorplans(connection);
+    if (m == "POST" && path == "/api/v1/coverage/floorplans") return handle_post_floorplans(connection, body);
+    if (m == "GET" && std::regex_match(path, match, std::regex("^/api/v1/coverage/floorplans/([^/]+)$")))
+        return handle_get_floorplan(connection, match[1].str());
+    if (m == "PUT" && std::regex_match(path, match, std::regex("^/api/v1/coverage/floorplans/([^/]+)$")))
+        return handle_put_floorplan(connection, match[1].str(), body);
+    if (m == "DELETE" && std::regex_match(path, match, std::regex("^/api/v1/coverage/floorplans/([^/]+)$")))
+        return handle_delete_floorplan(connection, match[1].str());
+    if (m == "GET" && path == "/api/v1/coverage/heatmap") return handle_get_heatmap(connection);
+    if (m == "GET" && std::regex_match(path, match, std::regex("^/api/v1/coverage/heatmap/([^/]+)$")))
+        return handle_get_band_heatmap(connection, match[1].str());
+    if (m == "POST" && path == "/api/v1/coverage/simulate") return handle_post_simulate_placement(connection, body);
+    if (m == "POST" && path == "/api/v1/coverage/placement/predict") return handle_post_predict_placement(connection, body);
+    if (m == "GET" && path == "/api/v1/coverage/weakzones") return handle_get_weak_zones(connection);
+    if (m == "GET" && path == "/api/v1/coverage/deadspots") return handle_get_dead_spots(connection);
+    if (m == "GET" && path == "/api/v1/coverage/report") return handle_get_coverage_report(connection);
+    if (m == "GET" && path == "/api/v1/coverage/report/pdf") return handle_get_coverage_report_pdf(connection);
+
+    // ===== Topology =====
+    if (m == "GET" && path == "/api/v1/topology") return handle_get_topology(connection);
+    if (m == "POST" && path == "/api/v1/topology/optimize") return handle_post_topology_optimize(connection);
+
+    // ===== Metrics / performance =====
+    if (m == "GET" && path == "/api/v1/metrics/devices") return handle_get_device_metrics(connection);
+    if (m == "GET" && path == "/api/v1/metrics/clients") return handle_get_client_metrics(connection);
+    if (m == "GET" && path == "/api/v1/metrics/performance") return handle_get_performance_metrics(connection);
+    if (m == "GET" && path == "/api/v1/metrics/interference") return handle_get_interference_analysis(connection);
+    if (m == "GET" && path == "/api/v1/performance/devices") return handle_get_all_devices_performance(connection);
+    if (m == "GET" && std::regex_match(path, match, std::regex("^/api/v1/performance/devices/([0-9A-Fa-f:]+)/clients$")))
+        return handle_get_device_clients_performance(connection, match[1].str());
+    if (m == "GET" && std::regex_match(path, match, std::regex("^/api/v1/performance/devices/([0-9A-Fa-f:]+)$")))
+        return handle_get_device_performance(connection, match[1].str());
+    if (m == "GET" && std::regex_match(path, match, std::regex("^/api/v1/performance/clients/([0-9A-Fa-f:]+)$")))
+        return handle_get_client_performance(connection, match[1].str());
+    if (m == "GET" && path == "/api/v1/performance/alarms") return handle_get_performance_alarms(connection);
+    if (m == "POST" && std::regex_match(path, match, std::regex("^/api/v1/performance/alarms/([^/]+)/acknowledge$")))
+        return handle_post_acknowledge_alarm(connection, match[1].str());
+
+    // ===== Config / security / firmware / reports / logs =====
+    if (m == "GET" && path == "/api/v1/config") return handle_get_config(connection);
+    if (m == "PUT" && path == "/api/v1/config") return handle_put_config(connection, body);
+    if (m == "GET" && path == "/api/v1/security/profiles") return handle_get_security_profiles(connection);
+    if (m == "GET" && path == "/api/v1/security/threats") return handle_get_threat_analysis(connection);
+    if (m == "GET" && path == "/api/v1/firmware/status") return handle_get_firmware_status(connection);
+    if (m == "POST" && path == "/api/v1/firmware/update") return handle_post_firmware_update(connection);
+    if (m == "GET" && path == "/api/v1/reports/usage") return handle_get_usage_report(connection);
+    if (m == "GET" && path == "/api/v1/reports/performance") return handle_get_performance_report(connection);
+    if (m == "GET" && path == "/api/v1/system/logs") return handle_get_system_logs(connection);
+
+    CJsonPtr err(cJSON_CreateObject());
+    add_str(err.get(), "error", "Not found");
+    return send_json(connection, MHD_HTTP_NOT_FOUND, to_json_string(err.get()));
+}
+
+MHD_Result HttpServer::dispatch(void* cls, struct MHD_Connection* connection,
+                                 const char* url, const char* method,
+                                 const char* version, const char* upload_data,
+                                 size_t* upload_data_size, void** con_cls) {
+    (void)cls; (void)version;
+
+    if (*con_cls == nullptr) {
+        // First call for this request: allocate context, don't process yet.
+        *con_cls = new ConnCtx();
+        return MHD_YES;
+    }
+
+    auto* ctx = reinterpret_cast<ConnCtx*>(*con_cls);
+
+    if (*upload_data_size != 0) {
+        // Body chunk arrived — accumulate and wait for more (or EOF).
+        ctx->body.append(upload_data, *upload_data_size);
+        *upload_data_size = 0;
+        return MHD_YES;
+    }
+
+    if (ctx->processed) {
+        // Shouldn't normally happen, but avoid double-processing defensively.
+        return MHD_YES;
+    }
+    ctx->processed = true;
+
+    return route(connection, method, url, ctx->body);
+}
+
+void HttpServer::request_completed(void* cls, struct MHD_Connection* connection,
+                                    void** con_cls, enum MHD_RequestTerminationCode toe) {
+    (void)cls; (void)connection; (void)toe;
+    if (*con_cls) {
+        delete reinterpret_cast<ConnCtx*>(*con_cls);
+        *con_cls = nullptr;
+    }
+}
+
+HttpServer::HttpServer(uint16_t port) : port_(port) {}
+
+HttpServer::~HttpServer() { stop(); }
+
+bool HttpServer::start() {
+    daemon_ = MHD_start_daemon(
+        MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG,
+        port_, nullptr, nullptr,
+        &HttpServer::dispatch, nullptr,
+        MHD_OPTION_NOTIFY_COMPLETED, &HttpServer::request_completed, nullptr,
+        MHD_OPTION_END);
+    return daemon_ != nullptr;
+}
+
+void HttpServer::stop() {
+    if (daemon_) {
+        MHD_stop_daemon(daemon_);
+        daemon_ = nullptr;
+    }
+}
