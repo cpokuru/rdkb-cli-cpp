@@ -41,10 +41,10 @@ static int http_callback(struct lws* wsi, enum lws_callback_reasons reason,
         size_t qpos = full_uri.find('?');
         sd->uri = (qpos != std::string::npos) ? full_uri.substr(0, qpos) : full_uri;
 
-        // Detect HTTP method via WSI_TOKEN_HTTP_METHOD (lws 2.3+)
-        char mbuf[16] = {};
-        lws_hdr_copy(wsi, mbuf, (int)sizeof(mbuf) - 1, WSI_TOKEN_HTTP_METHOD);
-        sd->method = (mbuf[0] != '\0') ? mbuf : "GET";
+        // Detect HTTP method using lws_http_get_uri_and_method() (lws 4.x+)
+        const char* m = nullptr;
+        lws_http_get_uri_and_method(wsi, &m, nullptr);
+        sd->method = (m && m[0] != '\0') ? m : "GET";
 
         // Requests without a body can be routed immediately
         if (sd->method == "GET" || sd->method == "DELETE" ||
