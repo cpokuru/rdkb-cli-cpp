@@ -41,14 +41,15 @@ static int http_callback(struct lws* wsi, enum lws_callback_reasons reason,
         size_t qpos = full_uri.find('?');
         sd->uri = (qpos != std::string::npos) ? full_uri.substr(0, qpos) : full_uri;
 
-        // Detect HTTP method using lws_http_get_uri_and_method() (lws 4.x+).
-        // The method is the *return value*; puri_ptr receives the URI pointer
-        // and puri_len receives its length — both must be non-null on lws 4.x
-        // or the function will dereference them and SIGSEGV.
-        const char* uri_ptr = nullptr;
-        size_t      uri_len = 0;
-        const char* m = lws_http_get_uri_and_method(wsi, &uri_ptr, &uri_len);
-        sd->method = (m && m[0] != '\0') ? m : "GET";
+        // Detect HTTP method using lws_http_get_uri_and_method() (lws 4.3).
+        // Actual installed signature:
+        //   int lws_http_get_uri_and_method(lws*, char** puri_ptr, int* puri_len)
+        // The method string is written into *puri_ptr; puri_len is int*.
+        char* method_ptr = nullptr;
+        int   method_len = 0;
+        lws_http_get_uri_and_method(wsi, &method_ptr, &method_len);
+        sd->method = (method_ptr && method_len > 0)
+                     ? std::string(method_ptr, (size_t)method_len) : "GET";
 
         // Requests without a body can be routed immediately
         if (sd->method == "GET" || sd->method == "DELETE" ||
@@ -172,6 +173,7 @@ WsServer::~WsServer() { stop(); }
 int WsServer::callback(struct lws* wsi, enum lws_callback_reasons reason,
                         void* user, void* in, size_t len) {
     auto* psd = reinterpret_cast<PerSessionData*>(user);
+    (void)in; (void)len;
 
     switch (reason) {
         case LWS_CALLBACK_ESTABLISHED: {
