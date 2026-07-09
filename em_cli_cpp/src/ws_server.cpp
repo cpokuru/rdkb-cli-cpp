@@ -1,11 +1,153 @@
 #include "ws_server.h"
+#include "http_server.h"
 #include "app_state.h"
 #include "json_helpers.h"
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <vector>
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// HTTP protocol — handles LWS_CALLBACK_HTTP and friends, routes to the same
+// dispatch table used by the old libmicrohttpd server, and writes the
+// response back via lws HTTP APIs.  This lets port 8888 serve both plain
+// HTTP and WebSocket upgrades with a single lws_context — same architecture
+// as the original Go net/http + gorilla/websocket version.
+// ---------------------------------------------------------------------------
+
+struct HttpSessionData {
+    std::string uri;
+    std::string method;
+    std::string req_body;          // accumulated request body chunks
+    std::string resp_body;
+    std::string resp_ct;           // Content-Type for response
+    int         resp_status = 200;
+    bool        resp_ready  = false;
+};
+
+static int http_callback(struct lws* wsi, enum lws_callback_reasons reason,
+                          void* user, void* in, size_t len) {
+    auto* sd = reinterpret_cast<HttpSessionData*>(user);
+
+    switch (reason) {
+
+    case LWS_CALLBACK_HTTP: {
+        new (sd) HttpSessionData();
+
+        // Capture URI (strip query string — route() doesn't use query params)
+        std::string full_uri((char*)in, len);
+        size_t qpos = full_uri.find('?');
+        sd->uri = (qpos != std::string::npos) ? full_uri.substr(0, qpos) : full_uri;
+
+        // Detect HTTP method via WSI_TOKEN_HTTP_METHOD (lws 2.3+)
+        char mbuf[16] = {};
+        lws_hdr_copy(wsi, mbuf, (int)sizeof(mbuf) - 1, WSI_TOKEN_HTTP_METHOD);
+        sd->method = (mbuf[0] != '\0') ? mbuf : "GET";
+
+        // Requests without a body can be routed immediately
+        if (sd->method == "GET" || sd->method == "DELETE" ||
+            sd->method == "OPTIONS" || sd->method == "HEAD") {
+            MHD_Connection conn;
+            conn.wsi = wsi;
+            route(&conn, sd->method, sd->uri, {});
+            sd->resp_body   = conn.body;
+            sd->resp_ct     = conn.content_type;
+            sd->resp_status = conn.status;
+            sd->resp_ready  = true;
+            lws_callback_on_writable(wsi);
+        }
+        return 0;
+    }
+
+    case LWS_CALLBACK_HTTP_BODY:
+        sd->req_body.append(reinterpret_cast<char*>(in), len);
+        return 0;
+
+    case LWS_CALLBACK_HTTP_BODY_COMPLETION: {
+        MHD_Connection conn;
+        conn.wsi = wsi;
+        route(&conn, sd->method, sd->uri, sd->req_body);
+        sd->resp_body   = conn.body;
+        sd->resp_ct     = conn.content_type;
+        sd->resp_status = conn.status;
+        sd->resp_ready  = true;
+        lws_callback_on_writable(wsi);
+        return 0;
+    }
+
+    case LWS_CALLBACK_HTTP_WRITEABLE: {
+        if (!sd->resp_ready) return 0;
+
+        // Build the HTTP response headers in a local buffer.
+        unsigned char hdr[LWS_PRE + 512];
+        unsigned char* start = hdr + LWS_PRE;
+        unsigned char* p     = start;
+        unsigned char* end   = hdr + sizeof(hdr) - 1;
+
+        if (lws_add_http_header_status(wsi, (unsigned int)sd->resp_status, &p, end))
+            return 1;
+
+        const std::string& ct = sd->resp_ct.empty() ? "application/json" : sd->resp_ct;
+        if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                (const unsigned char*)ct.c_str(), (int)ct.size(), &p, end))
+            return 1;
+
+        // CORS headers — same as the original Go corsMiddleware
+        static const char* ao = "*";
+        static const char* am = "GET, POST, PUT, DELETE, OPTIONS";
+        static const char* ah = "Content-Type, Authorization";
+        if (lws_add_http_header_by_name(wsi,
+                (const unsigned char*)"Access-Control-Allow-Origin:",
+                (const unsigned char*)ao, (int)strlen(ao), &p, end) ||
+            lws_add_http_header_by_name(wsi,
+                (const unsigned char*)"Access-Control-Allow-Methods:",
+                (const unsigned char*)am, (int)strlen(am), &p, end) ||
+            lws_add_http_header_by_name(wsi,
+                (const unsigned char*)"Access-Control-Allow-Headers:",
+                (const unsigned char*)ah, (int)strlen(ah), &p, end))
+            return 1;
+
+        if (lws_add_http_header_content_length(wsi,
+                (lws_filepos_t)sd->resp_body.size(), &p, end))
+            return 1;
+
+        if (lws_finalize_http_header(wsi, &p, end))
+            return 1;
+
+        // Write headers
+        if (lws_write(wsi, start, (size_t)(p - start), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+
+        // Write body (lws requires LWS_PRE bytes of padding before the data)
+        if (!sd->resp_body.empty()) {
+            std::vector<unsigned char> body_buf(LWS_PRE + sd->resp_body.size());
+            memcpy(body_buf.data() + LWS_PRE, sd->resp_body.data(), sd->resp_body.size());
+            if (lws_write(wsi, body_buf.data() + LWS_PRE,
+                          sd->resp_body.size(), LWS_WRITE_HTTP) < 0)
+                return 1;
+        }
+
+        if (lws_http_transaction_completed(wsi))
+            return -1;
+
+        return 0;
+    }
+
+    case LWS_CALLBACK_CLOSED_HTTP:
+        sd->~HttpSessionData();
+        return 0;
+
+    default:
+        break;
+    }
+    return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket protocol
+// ---------------------------------------------------------------------------
 
 struct PerSessionData {
     std::deque<std::string> outbox; // pending messages for this connection
@@ -90,6 +232,9 @@ int WsServer::callback(struct lws* wsi, enum lws_callback_reasons reason,
 }
 
 static struct lws_protocols s_protocols[] = {
+    // HTTP protocol must be first so lws handles plain HTTP requests and
+    // WebSocket upgrade requests on the same port.
+    { "http", http_callback, sizeof(HttpSessionData), 0, 0, nullptr, 0 },
     { "em-cli-realtime", WsServer::callback, sizeof(PerSessionData), 4096, 0, nullptr, 0 },
     { nullptr, nullptr, 0, 0, 0, nullptr, 0 } // terminator
 };

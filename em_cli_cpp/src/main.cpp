@@ -22,7 +22,6 @@
 #include <thread>
 #include <chrono>
 
-#include "http_server.h"
 #include "ws_server.h"
 #include "app_state.h"
 #include "handlers.h"
@@ -41,22 +40,12 @@ int main(int argc, char** argv) {
     seed_sample_data();
     init_wireless_and_coverage_defaults();
 
-    // REST API on 8888, matching the Go version's ListenAndServe("0.0.0.0:8888").
-    HttpServer http(8888);
-    if (!http.start()) {
-        fprintf(stderr, "Failed to start HTTP server on port 8888\n");
-        return 1;
-    }
-
-    // WebSocket on 8889 (separate port — libmicrohttpd and libwebsockets
-    // each own their listening socket; the original Go binary multiplexed
-    // both on :8888 via the same net/http mux, which gorilla/websocket can
-    // do but libmicrohttpd cannot hijack connections for. If you need them
-    // on one port, front both with nginx/haproxy, or I can switch the REST
-    // side to civetweb, which supports connection hijack for WS upgrade.)
-    WsServer ws(8889);
+    // Single server on port 8888: libwebsockets handles plain HTTP requests
+    // (LWS_CALLBACK_HTTP) and WebSocket upgrades on the same port — the same
+    // architecture as the original Go net/http + gorilla/websocket version.
+    WsServer ws(8888);
     if (!ws.start()) {
-        fprintf(stderr, "Failed to start WebSocket server on port 8889\n");
+        fprintf(stderr, "Failed to start HTTP + WebSocket server on port 8888\n");
         return 1;
     }
     set_global_ws_server(&ws);
@@ -65,8 +54,7 @@ int main(int argc, char** argv) {
     start_performance_background_task();
 
     printf("EasyMesh R6 Controller (C++) running\n");
-    printf("REST API:  http://0.0.0.0:8888/api/v1\n");
-    printf("WebSocket: ws://0.0.0.0:8889\n");
+    printf("HTTP + WebSocket: http://0.0.0.0:8888\n");
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -74,6 +62,5 @@ int main(int argc, char** argv) {
 
     printf("Shutting down...\n");
     ws.stop();
-    http.stop();
     return 0;
 }

@@ -5,7 +5,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(MICROHTTPD REQUIRED libmicrohttpd)
 pkg_check_modules(LIBWEBSOCKETS REQUIRED libwebsockets)
 pkg_check_modules(CJSON REQUIRED libcjson)
 
@@ -55,7 +54,6 @@ target_include_directories(onewifi_em_cli PRIVATE
     inc
     ${EM_CLI_INC_DIR}
     ${EM_CLI_EXTRA_INC_DIRS}
-    ${MICROHTTPD_INCLUDE_DIRS}
     ${LIBWEBSOCKETS_INCLUDE_DIRS}
     ${CJSON_INCLUDE_DIRS}
 )
@@ -63,7 +61,6 @@ target_include_directories(onewifi_em_cli PRIVATE
 link_directories(${EM_CLI_LIB_DIR})
 
 target_link_libraries(onewifi_em_cli PRIVATE
-    ${MICROHTTPD_LIBRARIES}
     ${LIBWEBSOCKETS_LIBRARIES}
     ${CJSON_LIBRARIES}
     emcli   # matches the original Makefile's -lemcli

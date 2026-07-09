@@ -9,15 +9,6 @@
 #include <fstream>
 #include <sstream>
 
-// Per-connection state while a request's body streams in across multiple
-// libmicrohttpd callback invocations. Go's net/http gives you a single
-// io.Reader for r.Body; libmicrohttpd calls the handler repeatedly with
-// chunks instead, so this plays the role Go's Request.Body played.
-struct ConnCtx {
-    std::string body;
-    bool processed = false;
-};
-
 static bool validate_ssid(const std::string& ssid);
 static bool validate_pass_phrase(const std::string& pass);
 
@@ -59,14 +50,10 @@ static MHD_Result serve_file(struct MHD_Connection* connection, const std::strin
     }
     std::ostringstream ss;
     ss << in.rdbuf();
-    std::string content = ss.str();
-
-    struct MHD_Response* response = MHD_create_response_from_buffer(
-        content.size(), (void*)content.c_str(), MHD_RESPMEM_MUST_COPY);
-    MHD_add_response_header(response, "Content-Type", content_type_for_extension(fs_path));
-    MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
-    MHD_destroy_response(response);
-    return ret;
+    connection->body         = ss.str();
+    connection->status       = MHD_HTTP_OK;
+    connection->content_type = content_type_for_extension(fs_path);
+    return MHD_YES;
 }
 
 // Blocks any path containing ".." so /static/../../etc/passwd-style
@@ -77,17 +64,11 @@ static bool path_is_safe(const std::string& rel_path) {
     return rel_path.find("..") == std::string::npos;
 }
 
-MHD_Result send_json(struct MHD_Connection* connection, int status_code, const std::string& body) {
-    struct MHD_Response* response = MHD_create_response_from_buffer(
-        body.size(), (void*)body.c_str(), MHD_RESPMEM_MUST_COPY);
-    MHD_add_response_header(response, "Content-Type", "application/json");
-    // Matches the original Go corsMiddleware
-    MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
-    MHD_add_response_header(response, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    MHD_add_response_header(response, "Access-Control-Allow-Headers", "Content-Type, Authorization");
-    MHD_Result ret = MHD_queue_response(connection, status_code, response);
-    MHD_destroy_response(response);
-    return ret;
+MHD_Result send_json(struct MHD_Connection* conn, int status_code, const std::string& body) {
+    conn->status       = status_code;
+    conn->content_type = "application/json";
+    conn->body         = body;
+    return MHD_YES;
 }
 
 // ===== Route handlers (equivalent to the *Handler funcs in main.go) =====
@@ -290,8 +271,8 @@ static bool validate_pass_phrase(const std::string& pass) {
 // Path params (e.g. {mac}) are matched with a light regex, same intent as
 // gorilla/mux's api.HandleFunc("/devices/{mac}", ...).
 
-static MHD_Result route(struct MHD_Connection* connection, const std::string& m,
-                         const std::string& path, const std::string& body) {
+MHD_Result route(struct MHD_Connection* connection, const std::string& m,
+                 const std::string& path, const std::string& body) {
     if (m == "OPTIONS") {
         return send_json(connection, MHD_HTTP_OK, "{}");
     }
@@ -412,64 +393,4 @@ static MHD_Result route(struct MHD_Connection* connection, const std::string& m,
     CJsonPtr err(cJSON_CreateObject());
     add_str(err.get(), "error", "Not found");
     return send_json(connection, MHD_HTTP_NOT_FOUND, to_json_string(err.get()));
-}
-
-MHD_Result HttpServer::dispatch(void* cls, struct MHD_Connection* connection,
-                                 const char* url, const char* method,
-                                 const char* version, const char* upload_data,
-                                 size_t* upload_data_size, void** con_cls) {
-    (void)cls; (void)version;
-
-    if (*con_cls == nullptr) {
-        // First call for this request: allocate context, don't process yet.
-        *con_cls = new ConnCtx();
-        return MHD_YES;
-    }
-
-    auto* ctx = reinterpret_cast<ConnCtx*>(*con_cls);
-
-    if (*upload_data_size != 0) {
-        // Body chunk arrived — accumulate and wait for more (or EOF).
-        ctx->body.append(upload_data, *upload_data_size);
-        *upload_data_size = 0;
-        return MHD_YES;
-    }
-
-    if (ctx->processed) {
-        // Shouldn't normally happen, but avoid double-processing defensively.
-        return MHD_YES;
-    }
-    ctx->processed = true;
-
-    return route(connection, method, url, ctx->body);
-}
-
-void HttpServer::request_completed(void* cls, struct MHD_Connection* connection,
-                                    void** con_cls, enum MHD_RequestTerminationCode toe) {
-    (void)cls; (void)connection; (void)toe;
-    if (*con_cls) {
-        delete reinterpret_cast<ConnCtx*>(*con_cls);
-        *con_cls = nullptr;
-    }
-}
-
-HttpServer::HttpServer(uint16_t port) : port_(port) {}
-
-HttpServer::~HttpServer() { stop(); }
-
-bool HttpServer::start() {
-    daemon_ = MHD_start_daemon(
-        MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG,
-        port_, nullptr, nullptr,
-        &HttpServer::dispatch, nullptr,
-        MHD_OPTION_NOTIFY_COMPLETED, &HttpServer::request_completed, nullptr,
-        MHD_OPTION_END);
-    return daemon_ != nullptr;
-}
-
-void HttpServer::stop() {
-    if (daemon_) {
-        MHD_stop_daemon(daemon_);
-        daemon_ = nullptr;
-    }
 }
