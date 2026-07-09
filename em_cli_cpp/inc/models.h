@@ -425,11 +425,36 @@ struct TopoSTA {
     std::string ssid;
 };
 
+// Mirrors Go's BSS struct (json tags: BSSID, MLDAddr, vapMode, haulType,
+// VlanId, Band, IEEE, ssid) — used inside TopoHaulType.bss_list, which the
+// topology renderer (map.js) reads directly for the haul-type overlay
+// circles (SSID label, VLAN, per-band BSSID/IEEE standard, MLD grouping).
+struct TopoBSS {
+    std::string bssid;
+    std::string mld_addr;
+    int vap_mode = 0;
+    std::string haul_type;
+    int vlan_id = 0;
+    int band = 0;
+    std::string ieee;
+    std::string ssid;
+};
+
+// Mirrors Go's HaulTypeVisual struct — one entry per distinct HaulType
+// (Fronthaul/Backhaul/Iot) present on a device's radios.
+struct TopoHaulType {
+    std::string name;
+    std::string ssid;
+    int vlan_id = 0;
+    std::vector<TopoBSS> bss_list;
+};
+
 struct TopoNode {
     std::string id;
     std::string name;
     double x = 0, y = 0;
     std::vector<TopoSTA> sta_list;
+    std::vector<TopoHaulType> haul_types;
 };
 
 struct TopoEdge {

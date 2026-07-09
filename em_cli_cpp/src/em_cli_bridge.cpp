@@ -10,6 +10,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cjson/cJSON.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 namespace em {
 
@@ -55,9 +59,15 @@ em_network_node_t* get_child(em_network_node_t* tree, const std::string& key) {
 void update_node_value(em_network_node_t* parent, const std::string& key, const std::string& new_val) {
     em_network_node_t* node = get_network_tree_by_key(parent, ckey(key));
     if (!node) return;
-    // Matches the Go version's fixed 256-byte buffer zero-then-copy exactly
-    // (buf := (*[256]byte)(unsafe.Pointer(&node.value_str[0]))).
-    constexpr size_t buf_size = 256;
+    // CORRECTED against the real em_base.h: value_str is em_long_string_t
+    // = char[128], NOT 256 as the Go source's comment claimed
+    // (buf := (*[256]byte)(unsafe.Pointer(&node.value_str[0]))). That Go
+    // code was reinterpreting a 128-byte C array as if it were 256 bytes —
+    // harmless in practice only because it never wrote a string longer
+    // than 128 bytes, but it was one un-checked write away from
+    // overflowing into value_int/num_children/child[]. Using the real
+    // size here closes that off properly rather than inheriting the bug.
+    constexpr size_t buf_size = sizeof(em_long_string_t); // 128, per em_base.h's em_network_node_t.value_str type
     std::memset(node->value_str, 0, buf_size);
     std::memcpy(node->value_str, new_val.data(), std::min(new_val.size(), buf_size - 1));
 }
@@ -673,8 +683,8 @@ bool update_controller_id(em_network_node_t* reset_tree, const std::string& sele
     if (!is_valid_mac(selected_mac)) return false;
     em_network_node_t* node = get_child(reset_tree, "ControllerID");
     if (!node) return false;
-    std::memset(node->value_str, 0, 256);
-    std::memcpy(node->value_str, selected_mac.data(), std::min(selected_mac.size(), size_t(255)));
+    std::memset(node->value_str, 0, sizeof(em_long_string_t));
+    std::memcpy(node->value_str, selected_mac.data(), std::min(selected_mac.size(), sizeof(em_long_string_t) - 1));
     return true;
 }
 
@@ -703,20 +713,51 @@ std::vector<std::string> get_interface_preference(em_network_node_t* tree) {
 
 // ===== Topology =====
 
-static std::vector<TopoSTA> build_sta_list(em_network_node_t* radio_list_tree) {
-    std::vector<TopoSTA> stas;
-    if (!radio_list_tree) return stas;
+// Parses one radio's BSSList into (band, BSS-details) pairs — shared by
+// both build_sta_list (client placement) and build_haul_types (SSID/VLAN
+// overlay circles), so the tree is only walked once per node.
+struct RadioBssInfo {
+    int band = 0;
+    std::string ieee;
+    std::vector<TopoBSS> bss;      // full BSS records, for haulTypes
+    std::vector<TopoSTA> stas;     // associated STAs only, for STA placement
+};
+
+static std::vector<RadioBssInfo> parse_radio_list_full(em_network_node_t* radio_list_tree) {
+    std::vector<RadioBssInfo> radios;
+    if (!radio_list_tree) return radios;
+
     for (int i = 0; i < static_cast<int>(radio_list_tree->num_children); i++) {
         em_network_node_t* radio = radio_list_tree->child[i];
         if (!radio) continue;
-        int band = get_key_int_value(radio, "Band");
+
+        RadioBssInfo r;
+        r.band = get_key_int_value(radio, "Band");
+        r.ieee = get_tree_value(radio, "IEEE");
+
         em_network_node_t* bss_list = get_child(radio, "BSSList");
-        if (!bss_list) continue;
+        if (!bss_list) { radios.push_back(r); continue; }
+
         for (int j = 0; j < static_cast<int>(bss_list->num_children); j++) {
             em_network_node_t* bss = bss_list->child[j];
             if (!bss) continue;
+
             std::string haul_type = get_tree_value(bss, "HaulType");
             std::string bss_ssid = get_tree_value(bss, "SSID");
+
+            if (!haul_type.empty()) {
+                TopoBSS tb;
+                tb.bssid = get_tree_value(bss, "BSSID");
+                tb.mld_addr = get_tree_value(bss, "MLDAddr");
+                tb.haul_type = haul_type;
+                tb.ssid = bss_ssid;
+                tb.vap_mode = get_key_int_value(bss, "VapMode");
+                tb.band = r.band;
+                tb.vlan_id = get_key_int_value(bss, "VlanId");
+                tb.ieee = r.ieee;
+                r.bss.push_back(tb);
+            }
+
             em_network_node_t* sta_list = get_child(bss, "STAList");
             if (!sta_list) continue;
             for (int k = 0; k < static_cast<int>(sta_list->num_children); k++) {
@@ -731,13 +772,45 @@ static std::vector<TopoSTA> build_sta_list(em_network_node_t* radio_list_tree) {
                 t.sta_mac = get_tree_value(sta, "MACAddress");
                 t.client_type = get_tree_value(sta, "ClientType");
                 t.mld_addr = get_tree_value(sta, "MLDAddr");
-                t.band = band;
+                t.band = r.band;
                 t.ssid = bss_ssid;
-                stas.push_back(t);
+                r.stas.push_back(t);
             }
         }
+        radios.push_back(r);
     }
-    return stas;
+    return radios;
+}
+
+// Direct port of Go's buildHaulTypes(): groups BSS entries by HaulType
+// (Fronthaul/Backhaul/Iot), keyed on first-seen SSID/VlanId per type, with
+// all matching BSS records collected underneath. Sorted by haul type name
+// to match the Go version's deterministic `sort.Strings(sortedNames)`.
+static std::vector<TopoHaulType> build_haul_types(const std::vector<RadioBssInfo>& radios) {
+    std::vector<std::pair<std::string, TopoHaulType>> ordered; // preserves insertion for lookup
+
+    for (auto& radio : radios) {
+        for (auto& bss : radio.bss) {
+            auto it = std::find_if(ordered.begin(), ordered.end(),
+                                    [&](auto& p) { return p.first == bss.haul_type; });
+            if (it == ordered.end()) {
+                TopoHaulType ht;
+                ht.name = bss.haul_type;
+                ht.ssid = bss.ssid;
+                ht.vlan_id = bss.vlan_id;
+                ordered.push_back({bss.haul_type, ht});
+                it = ordered.end() - 1;
+            }
+            it->second.bss_list.push_back(bss);
+        }
+    }
+
+    std::sort(ordered.begin(), ordered.end(),
+              [](auto& a, auto& b) { return a.first < b.first; });
+
+    std::vector<TopoHaulType> result;
+    for (auto& p : ordered) result.push_back(p.second);
+    return result;
 }
 
 TopologyResult build_topology_from_device_tree(em_network_node_t* device_node) {
@@ -755,7 +828,10 @@ TopologyResult build_topology_from_device_tree(em_network_node_t* device_node) {
         if (!backhaul_tree) return;
 
         em_network_node_t* radio_list_tree = (node->num_children > 2) ? node->child[2] : nullptr;
-        std::vector<TopoSTA> stas = build_sta_list(radio_list_tree);
+        auto radios_full = parse_radio_list_full(radio_list_tree);
+        std::vector<TopoSTA> stas;
+        for (auto& r : radios_full) stas.insert(stas.end(), r.stas.begin(), r.stas.end());
+        auto haul_types = build_haul_types(radios_full);
 
         std::string backhaul_mac = get_tree_value(backhaul_tree, "MACAddress");
         std::string backhaul_media = get_tree_value(backhaul_tree, "MediaType");
@@ -777,7 +853,7 @@ TopologyResult build_topology_from_device_tree(em_network_node_t* device_node) {
             y = parent_y + current_length * static_cast<float>(std::sin(theta));
         }
 
-        TopoNode tn; tn.id = device_id; tn.name = device_name; tn.x = x; tn.y = y; tn.sta_list = stas;
+        TopoNode tn; tn.id = device_id; tn.name = device_name; tn.x = x; tn.y = y; tn.sta_list = stas; tn.haul_types = haul_types;
         result.nodes.push_back(tn);
 
         em_network_node_t* child_list = get_child(backhaul_tree, "Child");
@@ -861,6 +937,50 @@ std::pair<std::string, unsigned int> get_controller_remote_ip() {
     if (cJSON* v = cJSON_GetObjectItem(parsed, "port")) if (cJSON_IsString(v)) port = static_cast<unsigned int>(std::atoi(v->valuestring));
     cJSON_Delete(parsed);
     return {ip, port};
+}
+
+std::pair<std::string, unsigned int> get_local_ip() {
+    const unsigned int ctrl_port = 49153;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return {"", ctrl_port};
+
+    struct sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(8888);
+    inet_pton(AF_INET, "8.8.8.8", &dest.sin_addr);
+
+    // connect() on a UDP socket sends no packets — it just lets the OS
+    // routing table pick which local interface/address would be used to
+    // reach that destination, which getsockname() then reveals. Same
+    // trick as Go's net.Dial("udp", "8.8.8.8:8888") + LocalAddr().
+    if (connect(sock, (struct sockaddr*)&dest, sizeof(dest)) < 0) {
+        close(sock);
+        return {"", ctrl_port};
+    }
+
+    struct sockaddr_in local{};
+    socklen_t len = sizeof(local);
+    if (getsockname(sock, (struct sockaddr*)&local, &len) < 0) {
+        close(sock);
+        return {"", ctrl_port};
+    }
+    close(sock);
+
+    char buf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local.sin_addr, buf, sizeof(buf));
+    return {std::string(buf), ctrl_port};
+}
+
+void init_controller_connection() {
+    auto [ip, port] = get_controller_remote_ip();
+    if (ip.empty()) {
+        auto [local_ip, local_port] = get_local_ip();
+        ip = local_ip;
+        port = local_port;
+    }
+    if (!ip.empty()) {
+        set_remote_addr_and_persist(ip, port);
+    }
 }
 
 } // namespace em

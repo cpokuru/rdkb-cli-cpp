@@ -336,6 +336,33 @@ cJSON* topo_node_to_json(const TopoNode& n) {
         cJSON_AddItemToArray(stas, so);
     }
     cJSON_AddItemToObject(o, "STAList", stas);
+
+    // Matches map.js's per-node haul-type overlay: haul.name, haul.ssid,
+    // haul.VlanId, and haul.BSSList[].{BSSID,MLDAddr,vapMode,Band,IEEE}.
+    cJSON* haul_types = cJSON_CreateArray();
+    for (auto& h : n.haul_types) {
+        cJSON* ho = cJSON_CreateObject();
+        add_str(ho, "name", h.name);
+        add_str(ho, "ssid", h.ssid);
+        cJSON_AddNumberToObject(ho, "VlanId", h.vlan_id);
+        cJSON* bss_arr = cJSON_CreateArray();
+        for (auto& b : h.bss_list) {
+            cJSON* bo = cJSON_CreateObject();
+            add_str(bo, "BSSID", b.bssid);
+            add_str(bo, "MLDAddr", b.mld_addr);
+            cJSON_AddNumberToObject(bo, "vapMode", b.vap_mode);
+            add_str(bo, "haulType", b.haul_type);
+            cJSON_AddNumberToObject(bo, "VlanId", b.vlan_id);
+            cJSON_AddNumberToObject(bo, "Band", b.band);
+            add_str(bo, "IEEE", b.ieee);
+            add_str(bo, "ssid", b.ssid);
+            cJSON_AddItemToArray(bss_arr, bo);
+        }
+        cJSON_AddItemToObject(ho, "BSSList", bss_arr);
+        cJSON_AddItemToArray(haul_types, ho);
+    }
+    cJSON_AddItemToObject(o, "haulTypes", haul_types);
+
     return o;
 }
 

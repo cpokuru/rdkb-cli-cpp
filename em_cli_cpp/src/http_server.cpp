@@ -50,24 +50,33 @@ static MHD_Result serve_file(struct MHD_Connection* connection, const std::strin
     }
     std::ostringstream ss;
     ss << in.rdbuf();
-    connection->body         = ss.str();
-    connection->status       = MHD_HTTP_OK;
-    connection->content_type = content_type_for_extension(fs_path);
-    return MHD_YES;
+    std::string content = ss.str();
+    return send_raw(connection, MHD_HTTP_OK, content_type_for_extension(fs_path), content);
 }
 
 // Blocks any path containing ".." so /static/../../etc/passwd-style
 // requests can't escape the static root — Go's http.FileServer does this
-// kind of normalization internally; libmicrohttpd doesn't, so it's done
-// here explicitly.
+// kind of normalization internally; this shim's transport (libwebsockets)
+// doesn't, so it's done here explicitly.
 static bool path_is_safe(const std::string& rel_path) {
     return rel_path.find("..") == std::string::npos;
 }
 
-MHD_Result send_json(struct MHD_Connection* conn, int status_code, const std::string& body) {
-    conn->status       = status_code;
-    conn->content_type = "application/json";
-    conn->body         = body;
+MHD_Result send_json(struct MHD_Connection* connection, int status_code, const std::string& body) {
+    connection->response_status = status_code;
+    connection->response_content_type = "application/json";
+    connection->response_body = body;
+    return MHD_YES;
+}
+
+MHD_Result send_raw(struct MHD_Connection* connection, int status_code,
+                     const std::string& content_type, const std::string& body,
+                     const std::string& extra_header_name, const std::string& extra_header_value) {
+    connection->response_status = status_code;
+    connection->response_content_type = content_type;
+    connection->response_body = body;
+    connection->extra_header_name = extra_header_name;
+    connection->extra_header_value = extra_header_value;
     return MHD_YES;
 }
 
@@ -272,7 +281,7 @@ static bool validate_pass_phrase(const std::string& pass) {
 // gorilla/mux's api.HandleFunc("/devices/{mac}", ...).
 
 MHD_Result route(struct MHD_Connection* connection, const std::string& m,
-                 const std::string& path, const std::string& body) {
+                  const std::string& path, const std::string& body) {
     if (m == "OPTIONS") {
         return send_json(connection, MHD_HTTP_OK, "{}");
     }

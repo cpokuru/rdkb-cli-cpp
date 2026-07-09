@@ -113,4 +113,19 @@ bool set_remote_addr_and_persist(const std::string& ip, unsigned int port);
 // file doesn't exist yet (matches the Go fallback behavior).
 std::pair<std::string, unsigned int> get_controller_remote_ip();
 
+// Matches Go's getLocalIP() — opens a UDP socket toward a well-known
+// external address purely to let the OS routing table pick the outbound
+// interface, then reads back that interface's local IP via getsockname().
+// No packet is actually sent. Used as the startup fallback when no
+// persisted controller IP exists yet in /nvram/remoteCtrl.json.
+std::pair<std::string, unsigned int> get_local_ip();
+
+// Startup equivalent of Go's main()'s unconditional
+// setRemoteIPandPort(remoteIP, remotePort) call: reads the persisted
+// controller IP if present, else falls back to get_local_ip(), then
+// calls set_remote_addr_and_persist(). Without this, the library's
+// is_remote_addr_valid() stays false and exec() calls silently degrade
+// to empty results instead of using a real controller connection.
+void init_controller_connection();
+
 } // namespace em

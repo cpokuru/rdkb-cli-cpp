@@ -1,7 +1,7 @@
 #include "ws_server.h"
-#include "http_server.h"
 #include "app_state.h"
 #include "json_helpers.h"
+#include "http_server.h"
 #include <cstring>
 #include <chrono>
 #include <algorithm>
@@ -9,160 +9,122 @@
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// HTTP protocol — handles LWS_CALLBACK_HTTP and friends, routes to the same
-// dispatch table used by the old libmicrohttpd server, and writes the
-// response back via lws HTTP APIs.  This lets port 8888 serve both plain
-// HTTP and WebSocket upgrades with a single lws_context — same architecture
-// as the original Go net/http + gorilla/websocket version.
-// ---------------------------------------------------------------------------
+// Single struct backs both connection types; `is_websocket` tags which
+// half is live. Connections are single-shot (no HTTP keep-alive — see the
+// close-after-response note in LWS_CALLBACK_HTTP_WRITEABLE below), so
+// LWS_CALLBACK_HTTP/LWS_CALLBACK_ESTABLISHED each fire exactly once before
+// the matching CLOSED reason, making placement-new/destroy here safe
+// without needing to guard against reuse mid-connection.
+struct PerSessionData {
+    bool is_websocket = false;
 
-struct HttpSessionData {
-    std::string uri;
+    // ----- WebSocket state -----
+    std::deque<std::string> outbox;
+
+    // ----- HTTP state -----
     std::string method;
-    std::string req_body;          // accumulated request body chunks
-    std::string resp_body;
-    std::string resp_ct;           // Content-Type for response
-    int         resp_status = 200;
-    bool        resp_ready  = false;
+    std::string path;
+    std::string body;
+    MHD_Connection conn;
+    bool response_ready = false;
+    bool headers_sent = false;
+    size_t body_offset = 0;
 };
 
-static int http_callback(struct lws* wsi, enum lws_callback_reasons reason,
-                          void* user, void* in, size_t len) {
-    auto* sd = reinterpret_cast<HttpSessionData*>(user);
+std::mutex g_conns_mu;
+std::vector<struct lws*> g_conns;
 
-    switch (reason) {
-
-    case LWS_CALLBACK_HTTP: {
-        new (sd) HttpSessionData();
-
-        // Capture URI (strip query string — route() doesn't use query params)
-        std::string full_uri((char*)in, len);
-        size_t qpos = full_uri.find('?');
-        sd->uri = (qpos != std::string::npos) ? full_uri.substr(0, qpos) : full_uri;
-
-        // Detect HTTP method using lws_http_get_uri_and_method() (lws 4.3).
-        // Actual installed signature:
-        //   int lws_http_get_uri_and_method(lws*, char** puri_ptr, int* puri_len)
-        // The method string is written into *puri_ptr; puri_len is int*.
-        char* method_ptr = nullptr;
-        int   method_len = 0;
-        lws_http_get_uri_and_method(wsi, &method_ptr, &method_len);
-        sd->method = (method_ptr && method_len > 0)
-                     ? std::string(method_ptr, (size_t)method_len) : "GET";
-
-        // Requests without a body can be routed immediately
-        if (sd->method == "GET" || sd->method == "DELETE" ||
-            sd->method == "OPTIONS" || sd->method == "HEAD") {
-            MHD_Connection conn;
-            conn.wsi = wsi;
-            route(&conn, sd->method, sd->uri, {});
-            sd->resp_body   = conn.body;
-            sd->resp_ct     = conn.content_type;
-            sd->resp_status = conn.status;
-            sd->resp_ready  = true;
-            lws_callback_on_writable(wsi);
-        }
-        return 0;
+const char* method_name(int lws_method) {
+    switch (lws_method) {
+        case LWSHUMETH_GET: return "GET";
+        case LWSHUMETH_POST: return "POST";
+        case LWSHUMETH_OPTIONS: return "OPTIONS";
+        case LWSHUMETH_PUT: return "PUT";
+        case LWSHUMETH_PATCH: return "PATCH";
+        case LWSHUMETH_DELETE: return "DELETE";
+        case LWSHUMETH_HEAD: return "HEAD";
+        default: return "GET";
     }
+}
 
-    case LWS_CALLBACK_HTTP_BODY:
-        sd->req_body.append(reinterpret_cast<char*>(in), len);
-        return 0;
+// Writes the queued WS message at the front of the outbox, matching the
+// original per-connection outbound queue behavior.
+void write_ws_message(struct lws* wsi, PerSessionData* psd) {
+    if (psd->outbox.empty()) return;
+    const std::string& msg = psd->outbox.front();
+    std::vector<unsigned char> buf(LWS_PRE + msg.size());
+    memcpy(buf.data() + LWS_PRE, msg.data(), msg.size());
+    lws_write(wsi, buf.data() + LWS_PRE, msg.size(), LWS_WRITE_TEXT);
+    psd->outbox.pop_front();
+    if (!psd->outbox.empty()) lws_callback_on_writable(wsi);
+}
 
-    case LWS_CALLBACK_HTTP_BODY_COMPLETION: {
-        MHD_Connection conn;
-        conn.wsi = wsi;
-        route(&conn, sd->method, sd->uri, sd->req_body);
-        sd->resp_body   = conn.body;
-        sd->resp_ct     = conn.content_type;
-        sd->resp_status = conn.status;
-        sd->resp_ready  = true;
+// Writes the HTTP response headers (once) and then the body, chunked if
+// needed so large payloads (e.g. coverage heatmaps) can't silently
+// truncate on a short lws_write(). Returns -1 to signal "close the
+// connection now" (either on completion or on error), 0 to keep going.
+int write_http_response(struct lws* wsi, PerSessionData* psd) {
+    if (!psd->headers_sent) {
+        uint8_t header_buf[LWS_PRE + 2048];
+        uint8_t* start = &header_buf[LWS_PRE];
+        uint8_t* p = start;
+        uint8_t* end = &header_buf[sizeof(header_buf) - 1];
+
+        if (lws_add_http_common_headers(wsi, psd->conn.response_status,
+                psd->conn.response_content_type.c_str(),
+                psd->conn.response_body.size(), &p, end)) {
+            return -1;
+        }
+        // Matches the original Go corsMiddleware.
+        if (lws_add_http_header_by_name(wsi, (const unsigned char*)"Access-Control-Allow-Origin:",
+                                         (const unsigned char*)"*", 1, &p, end)) return -1;
+        {
+            static const char* methods_val = "GET, POST, PUT, DELETE, OPTIONS";
+            if (lws_add_http_header_by_name(wsi, (const unsigned char*)"Access-Control-Allow-Methods:",
+                                             (const unsigned char*)methods_val,
+                                             (int)strlen(methods_val), &p, end)) return -1;
+        }
+        {
+            static const char* headers_val = "Content-Type, Authorization";
+            if (lws_add_http_header_by_name(wsi, (const unsigned char*)"Access-Control-Allow-Headers:",
+                                             (const unsigned char*)headers_val,
+                                             (int)strlen(headers_val), &p, end)) return -1;
+        }
+        if (!psd->conn.extra_header_name.empty()) {
+            std::string hname = psd->conn.extra_header_name + ":";
+            if (lws_add_http_header_by_name(wsi, (const unsigned char*)hname.c_str(),
+                                             (const unsigned char*)psd->conn.extra_header_value.c_str(),
+                                             (int)psd->conn.extra_header_value.size(), &p, end)) return -1;
+        }
+        if (lws_finalize_write_http_header(wsi, start, &p, end)) {
+            return -1;
+        }
+        psd->headers_sent = true;
+
+        if (psd->conn.response_body.empty()) {
+            return -1; // nothing more to send, done
+        }
         lws_callback_on_writable(wsi);
         return 0;
     }
 
-    case LWS_CALLBACK_HTTP_WRITEABLE: {
-        if (!sd->resp_ready) return 0;
+    constexpr size_t MAX_CHUNK = 8192;
+    size_t remain = psd->conn.response_body.size() - psd->body_offset;
+    size_t chunk = std::min(remain, MAX_CHUNK);
+    bool is_final = (psd->body_offset + chunk) >= psd->conn.response_body.size();
 
-        // Build the HTTP response headers in a local buffer.
-        unsigned char hdr[LWS_PRE + 512];
-        unsigned char* start = hdr + LWS_PRE;
-        unsigned char* p     = start;
-        unsigned char* end   = hdr + sizeof(hdr) - 1;
+    std::vector<unsigned char> buf(LWS_PRE + chunk);
+    memcpy(buf.data() + LWS_PRE, psd->conn.response_body.data() + psd->body_offset, chunk);
+    int n = lws_write(wsi, buf.data() + LWS_PRE, chunk, is_final ? LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP);
+    if (n < 0) return -1;
+    psd->body_offset += static_cast<size_t>(n);
 
-        if (lws_add_http_header_status(wsi, (unsigned int)sd->resp_status, &p, end))
-            return 1;
-
-        const std::string& ct = sd->resp_ct.empty() ? "application/json" : sd->resp_ct;
-        if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
-                (const unsigned char*)ct.c_str(), (int)ct.size(), &p, end))
-            return 1;
-
-        // CORS headers — same as the original Go corsMiddleware
-        static const char* ao = "*";
-        static const char* am = "GET, POST, PUT, DELETE, OPTIONS";
-        static const char* ah = "Content-Type, Authorization";
-        if (lws_add_http_header_by_name(wsi,
-                (const unsigned char*)"Access-Control-Allow-Origin:",
-                (const unsigned char*)ao, (int)strlen(ao), &p, end) ||
-            lws_add_http_header_by_name(wsi,
-                (const unsigned char*)"Access-Control-Allow-Methods:",
-                (const unsigned char*)am, (int)strlen(am), &p, end) ||
-            lws_add_http_header_by_name(wsi,
-                (const unsigned char*)"Access-Control-Allow-Headers:",
-                (const unsigned char*)ah, (int)strlen(ah), &p, end))
-            return 1;
-
-        if (lws_add_http_header_content_length(wsi,
-                (lws_filepos_t)sd->resp_body.size(), &p, end))
-            return 1;
-
-        if (lws_finalize_http_header(wsi, &p, end))
-            return 1;
-
-        // Write headers
-        if (lws_write(wsi, start, (size_t)(p - start), LWS_WRITE_HTTP_HEADERS) < 0)
-            return 1;
-
-        // Write body (lws requires LWS_PRE bytes of padding before the data)
-        if (!sd->resp_body.empty()) {
-            std::vector<unsigned char> body_buf(LWS_PRE + sd->resp_body.size());
-            memcpy(body_buf.data() + LWS_PRE, sd->resp_body.data(), sd->resp_body.size());
-            if (lws_write(wsi, body_buf.data() + LWS_PRE,
-                          sd->resp_body.size(), LWS_WRITE_HTTP) < 0)
-                return 1;
-        }
-
-        if (lws_http_transaction_completed(wsi))
-            return -1;
-
-        return 0;
+    if (psd->body_offset >= psd->conn.response_body.size()) {
+        return -1; // fully sent, close (see close-after-response note above)
     }
-
-    case LWS_CALLBACK_CLOSED_HTTP:
-        sd->~HttpSessionData();
-        return 0;
-
-    default:
-        break;
-    }
-    return lws_callback_http_dummy(wsi, reason, user, in, len);
+    lws_callback_on_writable(wsi);
+    return 0;
 }
-
-// ---------------------------------------------------------------------------
-// WebSocket protocol
-// ---------------------------------------------------------------------------
-
-struct PerSessionData {
-    std::deque<std::string> outbox; // pending messages for this connection
-};
-
-// All live connections + their per-session data, protected by one mutex.
-// Small connection counts expected on an embedded gateway UI, so a simple
-// vector + mutex is the right tool here (no need for lock-free structures).
-std::mutex g_conns_mu;
-std::vector<struct lws*> g_conns;
 
 } // namespace
 
@@ -173,18 +135,19 @@ WsServer::~WsServer() { stop(); }
 int WsServer::callback(struct lws* wsi, enum lws_callback_reasons reason,
                         void* user, void* in, size_t len) {
     auto* psd = reinterpret_cast<PerSessionData*>(user);
-    (void)in; (void)len;
 
     switch (reason) {
+
+        // ===== WebSocket lifecycle (unchanged from the two-port version) =====
         case LWS_CALLBACK_ESTABLISHED: {
             new (psd) PerSessionData();
+            psd->is_websocket = true;
             {
                 std::lock_guard<std::mutex> lock(g_conns_mu);
                 g_conns.push_back(wsi);
             }
             lwsl_notice("WebSocket client connected. Total: %zu\n", g_conns.size());
 
-            // Send initial payload, same as the Go handler's conn.WriteJSON(initialData)
             auto& state = AppState::instance();
             CJsonPtr root(cJSON_CreateObject());
             add_str(root.get(), "type", "initial");
@@ -206,18 +169,6 @@ int WsServer::callback(struct lws* wsi, enum lws_callback_reasons reason,
             break;
         }
 
-        case LWS_CALLBACK_SERVER_WRITEABLE: {
-            if (!psd->outbox.empty()) {
-                const std::string& msg = psd->outbox.front();
-                std::vector<unsigned char> buf(LWS_PRE + msg.size());
-                memcpy(buf.data() + LWS_PRE, msg.data(), msg.size());
-                lws_write(wsi, buf.data() + LWS_PRE, msg.size(), LWS_WRITE_TEXT);
-                psd->outbox.pop_front();
-                if (!psd->outbox.empty()) lws_callback_on_writable(wsi);
-            }
-            break;
-        }
-
         case LWS_CALLBACK_RECEIVE:
             // Client doesn't send data in this protocol (mirrors the Go
             // read loop, which only exists to detect close/errors).
@@ -231,6 +182,62 @@ int WsServer::callback(struct lws* wsi, enum lws_callback_reasons reason,
             break;
         }
 
+        case LWS_CALLBACK_SERVER_WRITEABLE: {
+            if (psd->is_websocket) write_ws_message(wsi, psd);
+            break;
+        }
+
+        // ===== HTTP lifecycle (new — this is what makes single-port
+        // REST+WS possible without libmicrohttpd) =====
+        case LWS_CALLBACK_HTTP: {
+            new (psd) PerSessionData();
+            psd->is_websocket = false;
+
+            char* uri_ptr = nullptr;
+            int uri_len = 0;
+            int meth = lws_http_get_uri_and_method(wsi, &uri_ptr, &uri_len);
+            psd->method = method_name(meth);
+            psd->path = (uri_len > 0 && uri_ptr) ? std::string(uri_ptr, uri_len) : "/";
+
+            // Strip query string — the router doesn't use it.
+            auto qpos = psd->path.find('?');
+            if (qpos != std::string::npos) psd->path = psd->path.substr(0, qpos);
+
+            // No Content-Length means no body coming — dispatch immediately
+            // rather than waiting for a BODY_COMPLETION that won't arrive
+            // for e.g. plain GETs.
+            if (lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_CONTENT_LENGTH) == 0) {
+                route(&psd->conn, psd->method, psd->path, psd->body);
+                psd->response_ready = true;
+                lws_callback_on_writable(wsi);
+            }
+            break;
+        }
+
+        case LWS_CALLBACK_HTTP_BODY: {
+            if (in && len > 0) psd->body.append(reinterpret_cast<const char*>(in), len);
+            break;
+        }
+
+        case LWS_CALLBACK_HTTP_BODY_COMPLETION: {
+            if (!psd->response_ready) {
+                route(&psd->conn, psd->method, psd->path, psd->body);
+                psd->response_ready = true;
+            }
+            lws_callback_on_writable(wsi);
+            break;
+        }
+
+        case LWS_CALLBACK_HTTP_WRITEABLE: {
+            if (psd->is_websocket || !psd->response_ready) break;
+            return write_http_response(wsi, psd);
+        }
+
+        case LWS_CALLBACK_CLOSED_HTTP: {
+            if (!psd->is_websocket) psd->~PerSessionData();
+            break;
+        }
+
         default:
             break;
     }
@@ -238,10 +245,7 @@ int WsServer::callback(struct lws* wsi, enum lws_callback_reasons reason,
 }
 
 static struct lws_protocols s_protocols[] = {
-    // HTTP protocol must be first so lws handles plain HTTP requests and
-    // WebSocket upgrade requests on the same port.
-    { "http", http_callback, sizeof(HttpSessionData), 0, 0, nullptr, 0 },
-    { "em-cli-realtime", WsServer::callback, sizeof(PerSessionData), 4096, 0, nullptr, 0 },
+    { "em-cli-unified", WsServer::callback, sizeof(PerSessionData), 8192, 0, nullptr, 0 },
     { nullptr, nullptr, 0, 0, 0, nullptr, 0 } // terminator
 };
 
@@ -252,6 +256,12 @@ bool WsServer::start() {
     info.protocols = s_protocols;
     info.gid = -1;
     info.uid = -1;
+    // TCP-level keepalive stands in for a WS-level ping/pong interval
+    // (this lws version's context info doesn't expose one directly) and
+    // detects dead sockets even with no application traffic. The 30s
+    // heartbeat broadcast (start_realtime_background_tasks) is an
+    // application-level "ping" that also carries useful data
+    // (connected_clients count), so it does double duty for WS clients.
     info.ka_time = 20;
     info.ka_probes = 3;
     info.ka_interval = 5;
@@ -289,6 +299,8 @@ void WsServer::broadcast(const std::string& json_message) {
             lws_callback_on_writable(wsi);
         }
     }
+    // Wake the service loop immediately rather than waiting for the next
+    // poll tick, so broadcasts feel instant (this is the "realtime" part).
     if (context_) lws_cancel_service(context_);
 }
 

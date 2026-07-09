@@ -8,12 +8,23 @@
 #include <thread>
 #include <atomic>
 
-// Real-time push layer. Mirrors the Go version's:
+// Real-time push layer AND REST transport — both now run through this one
+// libwebsockets context/port, matching the Go version's original
+// architecture (net/http + gorilla/websocket sharing one listening
+// socket via connection hijack). libwebsockets' single callback handles
+// both HTTP request/response reasons (LWS_CALLBACK_HTTP*) and WebSocket
+// lifecycle reasons (LWS_CALLBACK_ESTABLISHED/RECEIVE/etc) on the same
+// connection type, which is what makes single-port dual-protocol possible
+// here the way it isn't with libmicrohttpd (MHD can't hand a connection
+// off for a raw protocol upgrade the way lws or Go's net/http can).
+//
+// Mirrors the Go version's:
 //   - websocketHandler() -> upgrade + track connection
-//   - 25s ping ticker (per-connection keepalive)
+//   - TCP keepalive (ka_time/interval/probes) in place of a WS ping ticker
 //   - broadcastMessage() -> fan-out to all connected clients
 //   - 10s metrics updater ticker
 //   - 30s heartbeat ticker
+//   - the entire net/http request/response cycle -> route() in http_server.cpp
 //
 // libwebsockets is single-threaded per event loop by design (this is what
 // keeps it fast/low-memory), so outbound broadcasts are queued and flushed
