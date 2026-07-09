@@ -41,9 +41,13 @@ static int http_callback(struct lws* wsi, enum lws_callback_reasons reason,
         size_t qpos = full_uri.find('?');
         sd->uri = (qpos != std::string::npos) ? full_uri.substr(0, qpos) : full_uri;
 
-        // Detect HTTP method using lws_http_get_uri_and_method() (lws 4.x+)
-        char* m = nullptr;
-        lws_http_get_uri_and_method(wsi, &m, nullptr);
+        // Detect HTTP method using lws_http_get_uri_and_method() (lws 4.x+).
+        // The method is the *return value*; puri_ptr receives the URI pointer
+        // and puri_len receives its length — both must be non-null on lws 4.x
+        // or the function will dereference them and SIGSEGV.
+        const char* uri_ptr = nullptr;
+        size_t      uri_len = 0;
+        const char* m = lws_http_get_uri_and_method(wsi, &uri_ptr, &uri_len);
         sd->method = (m && m[0] != '\0') ? m : "GET";
 
         // Requests without a body can be routed immediately
@@ -246,14 +250,6 @@ bool WsServer::start() {
     info.protocols = s_protocols;
     info.gid = -1;
     info.uid = -1;
-    // This lws version's context info doesn't expose a WS-level ping/pong
-    // interval directly, so keepalive is handled two ways — same net effect
-    // as the Go 25s ping ticker:
-    //   1) TCP-level keepalive (ka_time/interval/probes) detects dead
-    //      sockets even with no application traffic.
-    //   2) The 30s heartbeat broadcast (see start_realtime_background_tasks)
-    //      is an application-level "ping" that also carries useful data
-    //      (connected_clients count), so it does double duty.
     info.ka_time = 20;
     info.ka_probes = 3;
     info.ka_interval = 5;
@@ -291,8 +287,6 @@ void WsServer::broadcast(const std::string& json_message) {
             lws_callback_on_writable(wsi);
         }
     }
-    // Wake the service loop immediately rather than waiting for the next
-    // poll tick, so broadcasts feel instant (this is the "realtime" part).
     if (context_) lws_cancel_service(context_);
 }
 
