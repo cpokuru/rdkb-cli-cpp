@@ -5,8 +5,7 @@ the Go `main.go` in `unified-wifi-mesh/src/rdkb-cli`, targeting a much
 smaller memory/binary footprint for the embedded gateway.
 
 ## Stack
-- **libmicrohttpd** — REST API (was gorilla/mux)
-- **libwebsockets**  — real-time WebSocket push (was gorilla/websocket)
+- **libwebsockets**  — HTTP REST + real-time WebSocket on the same port (was gorilla/mux + gorilla/websocket)
 - **cJSON**          — JSON (already a dependency in em_cli.cpp / Makefile)
 - Direct linkage against `libemcli` via `em_cli_apis.h` — no CGO marshaling
 
@@ -86,10 +85,12 @@ call sites.
 - `json_helpers*.{h,cpp}` — cJSON serialize/parse for every model type
 - `handlers_*.cpp` — one file per functional area (wireless, coverage,
   topology, performance, misc), each holding the REST handler functions
-- `http_server.cpp` — libmicrohttpd routing table + streamed-POST-body
-  handling (libmicrohttpd delivers bodies across multiple callbacks,
-  unlike Go's single `io.Reader`)
-- `ws_server.cpp` — libwebsockets real-time push, global broadcast accessor
+- `http_server.cpp` — routing table + HTTP handler shims; `route()` is called
+  from `ws_server.cpp`'s HTTP protocol callback; `send_json()` stores the
+  response into an `MHD_Connection` context for lws to flush
+- `ws_server.cpp` — single lws context on port 8888: HTTP protocol entry
+  (`http_callback`) handles `LWS_CALLBACK_HTTP` / body accumulation / response
+  write; WebSocket protocol entry handles real-time push and global broadcast
 
 ## IMPORTANT — before building on your target
 
@@ -116,11 +117,6 @@ names/types match my reconstruction.
 
 ## Known simplifications vs. the Go version (call these out if you need
 exact parity)
-- **Port split**: REST on `:8888`, WS on `:8889` as separate sockets,
-  because libmicrohttpd can't hijack a connection for WS upgrade the way
-  gorilla/websocket could multiplex both on `:8888`. Front both with
-  nginx/haproxy on one external port, or swap the REST layer to civetweb
-  (supports hijacking) if a single port is a hard requirement.
 - **Channel scan duration**: capped at 3s internally instead of literally
   sleeping the requested `scan_duration` (up to 300s) — the real
   driver-backed scan should replace this stub generator entirely; capping
@@ -155,7 +151,7 @@ to the `unified-wifi-mesh` checkout.
 
 ## Cross-compiling for the Filogic target
 Point CMake at your Yocto SDK's toolchain file, and make sure
-`libmicrohttpd-dev`, `libwebsockets-dev`, `libcjson-dev` are in your
+`libwebsockets-dev` and `libcjson-dev` are in your
 target's OpenEmbedded image recipe (libwebsockets specifically is already
 used elsewhere in RDK-B/CCSP, so check if it's already in your rootfs
 before adding a duplicate).
