@@ -34,6 +34,11 @@ set(EM_CLI_EXTRA_INC_DIRS
     CACHE STRING "Additional include dirs for em_cli_apis.h's transitive headers"
 )
 
+# rbus — confirmed present at /usr/include/rbus/ on the real gateway
+# (rbus.h, rbus_object.h, rbus_property.h, rbus_value.h, rbuscore.h).
+set(RBUS_INC_DIR "/usr/include/rbus" CACHE STRING "Path to rbus headers")
+set(RBUS_LIB_DIR "/usr/lib" CACHE STRING "Path to librbus.so")
+
 add_executable(onewifi_em_cli
     src/main.cpp
     src/http_server.cpp
@@ -42,6 +47,9 @@ add_executable(onewifi_em_cli
     src/json_helpers_ext.cpp
     src/sample_data.cpp
     src/em_cli_bridge.cpp
+    src/rbus_bridge.cpp
+    src/rbus_datamodel_bridge.cpp
+    src/handlers_rbus.cpp
     src/coverage.cpp
     src/handlers_wireless.cpp
     src/handlers_coverage.cpp
@@ -54,16 +62,28 @@ target_include_directories(onewifi_em_cli PRIVATE
     inc
     ${EM_CLI_INC_DIR}
     ${EM_CLI_EXTRA_INC_DIRS}
+    ${RBUS_INC_DIR}
     ${LIBWEBSOCKETS_INCLUDE_DIRS}
     ${CJSON_INCLUDE_DIRS}
 )
 
-link_directories(${EM_CLI_LIB_DIR})
+link_directories(${EM_CLI_LIB_DIR} ${RBUS_LIB_DIR})
 
 target_link_libraries(onewifi_em_cli PRIVATE
     ${LIBWEBSOCKETS_LIBRARIES}
     ${CJSON_LIBRARIES}
-    emcli   # matches the original Makefile's -lemcli
+    emcli   # matches the original Makefile's -lemcli — still needed for
+            # radios/policy/reset/unassoc-STA, which don't have a verified
+            # rbus path yet (see rbus_datamodel_bridge.h's header comment)
+    rbus
+    rbuscore
+    # NOTE: librbusmethod deliberately NOT linked — it's provider-side
+    # infrastructure (for registering/serving methods on the bus) with its
+    # own broken transitive deps on this system (undefined Vector_*/T2Log
+    # symbols from RDK utility/telemetry libs this project doesn't use).
+    # rbusMethod_Invoke is a consumer-side call declared in the main
+    # rbus.h public API and resolves fine from librbus.so alone — this
+    # project only calls methods, never registers/serves one.
     pthread
 )
 

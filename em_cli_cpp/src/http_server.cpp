@@ -1,7 +1,8 @@
 #include "http_server.h"
 #include "app_state.h"
 #include "json_helpers.h"
-#include "em_cli_bridge.h"
+#include "rbus_datamodel_bridge.h"
+#include "rbus_bridge.h"
 #include "handlers.h"
 #include <cstring>
 #include <cstdio>
@@ -194,20 +195,11 @@ static MHD_Result handle_system_status(struct MHD_Connection* connection) {
     return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
 }
 
-// ===== Wireless profiles (first handler wired to the real em_cli library) =====
-// Direct translation of getWirelessProfilesHandler from main.go. Notice
-// there's no C.CString/C.free anywhere — em::exec_cmd and em::get_child
-// take std::string and do the C-string handling internally, once.
+// ===== Wireless profiles (now rbus-backed, per the full-replace decision
+// — see rbus_datamodel_bridge.cpp) =====
 
 static MHD_Result handle_get_wireless_profiles(struct MHD_Connection* connection) {
-    em_network_node_t* ssid_tree = em::exec_cmd("get_ssid OneWifiMesh");
-    if (!ssid_tree) {
-        CJsonPtr err(cJSON_CreateObject());
-        add_str(err.get(), "error", "Failed to fetch ssid tree");
-        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
-    }
-
-    std::vector<HaulConfig> hauls = em::get_configured_hauls(ssid_tree);
+    std::vector<HaulConfig> hauls = em_rbus::get_wireless_profiles();
 
     CJsonPtr root(cJSON_CreateObject());
     cJSON* arr = cJSON_CreateArray();
@@ -226,13 +218,15 @@ static MHD_Result handle_post_wireless_profiles(struct MHD_Connection* connectio
         return send_json(connection, MHD_HTTP_BAD_REQUEST, to_json_string(err.get()));
     }
 
-    em_network_node_t* ssid_tree = em::exec_cmd("get_ssid OneWifiMesh");
-    if (!ssid_tree) {
-        CJsonPtr err(cJSON_CreateObject());
-        add_str(err.get(), "error", "Failed to fetch ssid tree");
-        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
-    }
-
+    // NOTE: Device.WiFi.DataElements.Network.SetSSID is a method
+    // (confirmed via `discelements tr_181_service`), not a plain settable
+    // property — so this goes through rbusMethod_Invoke, not rbus_set.
+    // The param names below (SSID/PassPhrase/Band/HaulType) are inferred
+    // from TR-181 naming conventions and the SSID.{i}.* table's own field
+    // names, but the exact expected shape for SetSSID's *input* object
+    // hasn't been confirmed against a real invocation yet — verify this
+    // against a real device before relying on it, e.g. by trying it on one
+    // profile first and checking the SSID actually changes.
     int n = cJSON_GetArraySize(parsed.get());
     for (int i = 0; i < n; i++) {
         HaulConfig haul = haul_config_from_json(cJSON_GetArrayItem(parsed.get(), i));
@@ -242,22 +236,26 @@ static MHD_Result handle_post_wireless_profiles(struct MHD_Connection* connectio
             add_str(err.get(), "error", "Invalid SSID for " + haul.haul_type);
             return send_json(connection, MHD_HTTP_BAD_REQUEST, to_json_string(err.get()));
         }
-        if (!validate_pass_phrase(haul.pass_phrase)) {
+        if (!haul.pass_phrase.empty() && !validate_pass_phrase(haul.pass_phrase)) {
             CJsonPtr err(cJSON_CreateObject());
             add_str(err.get(), "error", "Invalid PassPhrase for " + haul.haul_type);
             return send_json(connection, MHD_HTTP_BAD_REQUEST, to_json_string(err.get()));
         }
-        if (!em::update_network_ssid_list(ssid_tree, haul, true)) {
+
+        CJsonPtr params(cJSON_CreateObject());
+        add_str(params.get(), "SSID", haul.ssid);
+        add_str(params.get(), "HaulType", haul.haul_type);
+        if (!haul.pass_phrase.empty()) add_str(params.get(), "PassPhrase", haul.pass_phrase);
+        cJSON_AddBoolToObject(params.get(), "Enable", haul.enabled);
+
+        CJsonPtr result(em_rbus::invoke_method("Device.WiFi.DataElements.Network.SetSSID", params.get()));
+        cJSON* error_field = cJSON_GetObjectItem(result.get(), "error");
+        if (error_field) {
             CJsonPtr err(cJSON_CreateObject());
-            add_str(err.get(), "error", "Update failed for " + haul.haul_type);
+            add_str(err.get(), "error", "SetSSID failed for " + haul.haul_type + ": " +
+                    (cJSON_IsString(error_field) ? error_field->valuestring : "unknown error"));
             return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
         }
-    }
-
-    if (!em::apply_network_name_config(ssid_tree)) {
-        CJsonPtr err(cJSON_CreateObject());
-        add_str(err.get(), "error", "Failed to update networkssid list");
-        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
     }
 
     CJsonPtr root(cJSON_CreateObject());
@@ -398,6 +396,21 @@ MHD_Result route(struct MHD_Connection* connection, const std::string& m,
     if (m == "GET" && path == "/api/v1/reports/usage") return handle_get_usage_report(connection);
     if (m == "GET" && path == "/api/v1/reports/performance") return handle_get_performance_report(connection);
     if (m == "GET" && path == "/api/v1/system/logs") return handle_get_system_logs(connection);
+
+    // ===== rbus explorer (debug/inspection UI) =====
+    if (m == "GET" && path == "/api/v1/rbus/status") return handle_get_rbus_status(connection);
+    if (m == "POST" && path == "/api/v1/rbus/components") {
+        CJsonPtr parsed(cJSON_Parse(body.c_str()));
+        cJSON* p = parsed ? cJSON_GetObjectItem(parsed.get(), "path") : nullptr;
+        return handle_get_rbus_components(connection, (p && cJSON_IsString(p)) ? p->valuestring : "");
+    }
+    if (m == "POST" && path == "/api/v1/rbus/elements") {
+        CJsonPtr parsed(cJSON_Parse(body.c_str()));
+        cJSON* c = parsed ? cJSON_GetObjectItem(parsed.get(), "component") : nullptr;
+        return handle_get_rbus_elements(connection, (c && cJSON_IsString(c)) ? c->valuestring : "");
+    }
+    if (m == "POST" && path == "/api/v1/rbus/get") return handle_post_rbus_get(connection, body);
+    if (m == "POST" && path == "/api/v1/rbus/invoke") return handle_post_rbus_method_invoke(connection, body);
 
     CJsonPtr err(cJSON_CreateObject());
     add_str(err.get(), "error", "Not found");

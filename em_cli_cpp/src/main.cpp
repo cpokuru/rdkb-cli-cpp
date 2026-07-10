@@ -25,9 +25,10 @@
 #include "ws_server.h"
 #include "app_state.h"
 #include "handlers.h"
-#include "em_cli_bridge.h"
+#include "rbus_bridge.h"
 
-void seed_sample_data(); // src/sample_data.cpp — replaced by em_cli data load in next batch
+void seed_sample_data(); // src/sample_data.cpp — initial fallback fixtures,
+                          // overwritten by the first successful rbus fetch
 
 static std::atomic<bool> g_running{true};
 
@@ -40,12 +41,14 @@ int main(int argc, char** argv) {
 
     seed_sample_data();
     init_wireless_and_coverage_defaults();
-    // Matches Go main()'s unconditional getControllerRemoteIP()/getLocalIP()
-    // + setRemoteIPandPort() sequence — without this, the library's
-    // is_remote_addr_valid() stays false and every exec() call to the
-    // controller silently degrades to empty results instead of a real
-    // connection. This was missing entirely in earlier builds.
-    em::init_controller_connection();
+
+    // Full replace of the em_cli/exec()/TLS-controller path with rbus —
+    // opens the consumer handle once at startup (component name
+    // "onewifi_em_cli_rbus_explorer"). Every REST handler that used to
+    // call em::exec_cmd() now goes through rbus_datamodel_bridge.cpp
+    // instead, which itself calls into rbus_bridge.cpp's verified
+    // rbus_open/rbus_getExt/rbusMethod_Invoke wrappers.
+    em_rbus::init();
 
     // REST + WebSocket + static dashboard files, all on :8888 — matches
     // the Go version's single ListenAndServe("0.0.0.0:8888") exactly,
@@ -60,15 +63,18 @@ int main(int argc, char** argv) {
 
     start_realtime_background_tasks(server);
     start_performance_background_task();
+    start_rbus_refresh_task();
 
     printf("EasyMesh R6 Controller (C++) running\n");
     printf("REST API + WebSocket + dashboard: http://0.0.0.0:8888\n");
+    printf("rbus: %s\n", em_rbus::is_connected() ? "connected" : em_rbus::last_error().c_str());
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     printf("Shutting down...\n");
+    em_rbus::shutdown();
     server.stop();
     return 0;
 }

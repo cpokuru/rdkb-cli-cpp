@@ -3,6 +3,7 @@
 #include "app_state.h"
 #include "json_helpers.h"
 #include "ws_server.h"
+#include "rbus_datamodel_bridge.h"
 #include <thread>
 #include <chrono>
 #include <algorithm>
@@ -357,6 +358,33 @@ void start_performance_background_task() {
 
                 h->last_updated = now_epoch();
             }
+        }
+    }).detach();
+}
+
+// ===== rbus-backed devices/clients refresh (full-replace-exec() path) =====
+
+void start_rbus_refresh_task() {
+    std::thread([]() {
+        while (true) {
+            auto devices = em_rbus::get_devices();
+            auto clients = em_rbus::get_clients();
+
+            auto& state = AppState::instance();
+            if (!devices.empty()) {
+                std::unique_lock lock(state.devices_mu);
+                state.devices = devices;
+            }
+            if (!clients.empty()) {
+                std::unique_lock lock(state.clients_mu);
+                state.clients = clients;
+            }
+            // Sample data (sample_data.cpp) stays in place as whatever was
+            // there before the first successful rbus fetch — if rbus isn't
+            // connected yet at startup, the dashboard shows the fallback
+            // fixtures rather than an empty screen, and picks up real data
+            // as soon as this loop's first successful fetch lands.
+            std::this_thread::sleep_for(std::chrono::seconds(10));
         }
     }).detach();
 }

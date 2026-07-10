@@ -54,7 +54,117 @@ simultaneously on `:8888` in the same test run, including REST calls still
 working correctly *while* a WS connection is active — under
 AddressSanitizer, no memory errors.
 
-## Live deployment finding: controller connection was never initialized (real bug, now fixed)
+## Live deployment finding #2: large rbus string values were silently truncated (real bug, now fixed)
+
+Deployed and linking, `/api/v1/rbus/status` showed `connected: true` and the
+raw `/api/v1/rbus/get` explorer endpoint returned real data — but
+`/api/v1/topology` still came back empty. The raw explorer output revealed
+why: the JSON value was cut off mid-string
+(`..."TimeStamp":"2026-07-09T23:58` — nothing after it). Root cause:
+`rbus_bridge.cpp`'s `add_value_fields()` used `rbusValue_ToString()` into a
+fixed 1024-byte stack buffer for *every* value type, including strings.
+`Device.WiFi.DataElements.Network.Topology` is a full nested mesh JSON
+blob — several KB on a real 3+ device mesh — so it silently truncated mid-
+object. The truncated string then failed to parse as JSON in
+`get_topology()`, which returned an empty result with no error at all
+(matching the "I don't see the real data" symptom exactly — this wasn't a
+connectivity or ACL problem, `rbus_get` itself worked fine the whole time).
+
+Fixed: string-typed values now go through `rbusValue_GetString(value,
+&len)` instead — a direct pointer + explicit length with no size limit,
+the correct extraction path for `RBUS_STRING` values (vs. `ToString`,
+which is meant for generic scalar-to-display-string conversion into a
+caller-owned buffer, appropriate for a bool/int/etc. but not an
+arbitrary-length string). Verified with a 2000+ character test string
+(deliberately past the old 1024-byte truncation point) — parses correctly
+end-to-end now.
+
+
+
+Following the discovery that `Device.WiFi.DataElements.*` is exposed over
+**rbus** (RDK's native IPC bus, TR-181 data model) and already working
+reliably on the live gateway (`rbuscli` returns real data instantly, no
+TLS-socket dependency on the `ieee1905_em_ctrl` controller), the highest-
+confidence handlers were migrated off `exec()` entirely:
+
+**Verified rbus function signatures** — a starting `rbus_bridge.cpp` had
+already been written against "commonly documented" rbus API signatures.
+Same lesson as `em_cli_apis.h`: verified against the real headers (pulled
+from `/usr/include/rbus/` on the actual gateway) and found two real bugs:
+- `rbus_discoverComponentName`'s output type is `char***` (plain C-string
+  array) — the `rbusComponentName` struct used previously doesn't exist
+  anywhere in this rbus version's headers.
+- `rbus_getExt`'s properties out-param is `rbusProperty_t*` — a single
+  opaque handle to the **head of a linked list** (walked via
+  `rbusProperty_GetNext()`), not an array indexed with `properties[i]`.
+  This one would have compiled fine (both look like double-pointers at a
+  glance) but returned garbage or crashed at runtime.
+
+Both fixed in `rbus_bridge.cpp` against the verified signatures.
+
+**New file, `rbus_datamodel_bridge.cpp`** — maps real TR-181 paths
+(confirmed via `discelements WifiCtrl`/`discelements tr_181_service` on
+the live gateway) to the existing `Device`/`Client`/`HaulConfig`/`TopoNode`
+structs, using `rbus_getExt`'s documented wildcard-query support
+(`SSID.*.SSID`) for single-round-trip table reads instead of a
+`NumberOfEntries` lookup + N-iteration loop:
+
+- **`get_topology()`** — `Device.WiFi.DataElements.Network.Topology` is
+  already the exact nested `Device`/`Backhaul`/`RadioList`/`BSSList`/
+  `STAList` JSON shape `em_cli_bridge.cpp` used to reconstruct by hand
+  from the `exec()` tree. One string get, parse, done — the same
+  `buildHaulTypes`-equivalent traversal logic (verified earlier against
+  real `topology3.json`) is reused here, just walking a `cJSON*` tree
+  instead of `em_network_node_t*`.
+- **`get_clients()`** — derived from the *same* Topology fetch (walking
+  every `STAList` across every `BSS`) rather than a second round-trip.
+- **`get_devices()`** — `Device.{i}.Manufacturer/SerialNumber/
+  ManufacturerModel/SoftwareVersion` wildcard-queried, cross-referenced
+  against a `get_topology()` call for role (Controller/Agent) since the
+  metadata table alone doesn't carry backhaul type.
+- **`get_wireless_profiles()`** — `SSID.{i}.SSID/Band/Enable/HaulType`
+  wildcard-queried and grouped by `(HaulType, SSID)` — verified end-to-end
+  against fake data shaped exactly like the real device's dump (two SSID
+  rows, same name, different bands, correctly merged into one profile
+  card with `Band: ["2.4GHz","5GHz"]`).
+
+**Devices/clients refresh**: a new 10s background task
+(`start_rbus_refresh_task()`) re-fetches `get_devices()`/`get_clients()`
+and updates `AppState` — every existing handler that reads `AppState`
+(performance tracking, metrics, health score, WS broadcasts) keeps working
+unchanged, just backed by real data now instead of the `sample_data.cpp`
+fixtures (which stay in place as the initial fallback until the first
+successful rbus fetch lands, so the dashboard never shows a blank screen).
+
+**Wireless profiles POST** now calls `Device.WiFi.DataElements.Network.
+SetSSID` via `rbusMethod_Invoke` (confirmed as a *method*, not a plain
+settable property, via the `tr_181_service` discovery) — the exact input
+parameter shape for `SetSSID` hasn't been confirmed against a real
+invocation yet, so verify this on one profile before relying on it.
+
+**What's still on the `exec()`/TLS path, and why**: `radios` (channel
+config), `wifipolicy`, `wifireset`, `unassoc_sta_query`, and
+`controllerIPConfig` remain on `em_cli_bridge.cpp`/`exec()`. The
+`discelements` dump provided showed **no policy-related TR-181 elements
+anywhere**, and no confirmed path for channel-preference SET — migrating
+those without verified evidence would repeat the exact guessing mistake
+this whole review process was set up to avoid. `em_cli_bridge.cpp` and
+`-lemcli` stay in the build alongside rbus for these specific endpoints.
+
+**rbus explorer** (`/api/v1/rbus/status`, `/rbus/elements`, `/rbus/
+components`, `/rbus/get`, `/rbus/invoke`, plus `static/rbus_explorer.html`)
+— a generic rbus debug/inspection UI, useful for finding TR-181 paths for
+the remaining `exec()`-based endpoints without needing SSH + `rbuscli`
+each time. Deploy `rbus_explorer.html` to `/usr/ccsp/EasyMesh/static/`
+alongside the other static assets.
+
+**Verified end-to-end** with a fake `librbus` implementation shaped like
+the real device's actual data (same two-SSID-row structure, same Topology
+JSON nesting): topology, wireless profiles, devices, and clients all
+returned correctly through the full REST + rbus stack, including the
+grouping logic that merges per-band SSID rows into one profile card.
+
+
 
 Deployed against your real `ieee1905_em_ctrl` service, every endpoint that
 calls into the em_cli library (`/wireless/profiles`, `/topology`, etc.)

@@ -2,18 +2,11 @@
 #include "http_server.h"
 #include "app_state.h"
 #include "json_helpers.h"
-#include "em_cli_bridge.h"
+#include "rbus_datamodel_bridge.h"
 #include "ws_server.h"
 
 MHD_Result handle_get_topology(struct MHD_Connection* connection) {
-    em_network_node_t* topology_tree = em::exec_cmd("get_network OneWifiMesh");
-    if (!topology_tree) {
-        CJsonPtr err(cJSON_CreateObject());
-        add_str(err.get(), "error", "Failed to fetch topology tree");
-        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
-    }
-    em_network_node_t* device_tree = em::get_child(topology_tree, "Device");
-    auto result = em::build_topology_from_device_tree(device_tree);
+    auto result = em_rbus::get_topology();
 
     CJsonPtr root(cJSON_CreateObject());
     cJSON* nodes = cJSON_CreateArray();

@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>rbus Explorer — EasyMesh Controller</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1420; --panel: #161d2e; --panel2: #1d2537; --border: #2a3450;
+    --text: #e6ebf5; --muted: #8b96b3; --accent: #4f8cff; --accent2: #2fd48a;
+    --warn: #ffb454; --err: #ff6b6b; --mono: "SF Mono", Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  #status-badge {
+    padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600;
+  }
+  .badge-ok { background: rgba(47,212,138,0.15); color: var(--accent2); }
+  .badge-bad { background: rgba(255,107,107,0.15); color: var(--err); }
+  main { padding: 20px; max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px;
+  }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input[type=text] {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 10px; border-radius: 6px; font-family: var(--mono); font-size: 13px; flex: 1; min-width: 240px;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent); color: white; border: none; padding: 8px 14px;
+    border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.secondary { background: var(--panel2); border: 1px solid var(--border); color: var(--text); }
+  button.small { padding: 4px 9px; font-size: 12px; font-weight: 500; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  .chip {
+    background: var(--panel2); border: 1px solid var(--border); padding: 5px 10px;
+    border-radius: 14px; font-family: var(--mono); font-size: 12px; cursor: pointer; color: var(--accent);
+  }
+  .chip:hover { border-color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase;
+       padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); font-family: var(--mono); }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .kind { padding: 2px 7px; border-radius: 10px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+  .kind-table { background: rgba(79,140,255,0.15); color: var(--accent); }
+  .kind-property { background: rgba(255,255,255,0.06); color: var(--muted); }
+  .kind-row_property { background: rgba(255,255,255,0.06); color: var(--muted); }
+  .kind-count { background: rgba(255,180,84,0.15); color: var(--warn); }
+  .kind-component_root { background: rgba(47,212,138,0.15); color: var(--accent2); }
+  .actions { display: flex; gap: 4px; }
+  #elements-wrap { max-height: 480px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
+  #result-panel pre {
+    background: #0a0e18; border: 1px solid var(--border); border-radius: 6px; padding: 12px;
+    max-height: 420px; overflow: auto; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+  .muted { color: var(--muted); font-size: 12px; }
+  .err-text { color: var(--err); }
+  .filter-row { margin-bottom: 4px; }
+  #invoke-modal-bg {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; z-index: 50;
+  }
+  #invoke-modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px;
+    width: 480px; max-width: 92vw;
+  }
+  #invoke-modal h3 { margin: 0 0 4px; font-size: 14px; font-family: var(--mono); word-break: break-all; }
+  #invoke-modal textarea {
+    width: 100%; height: 120px; background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 8px; font-family: var(--mono); font-size: 12px; margin: 10px 0; resize: vertical;
+  }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>rbus Explorer <span>— generic component/element/method browser</span></h1>
+  <span id="status-badge" class="badge-bad">checking…</span>
+</header>
+
+<main>
+
+  <div class="panel">
+    <h2>1 · Find components owning a path</h2>
+    <div class="row">
+      <input type="text" id="path-input" placeholder="e.g. Device.WiFi.DataElements.Network."
+             value="Device.WiFi.DataElements.Network.">
+      <button onclick="discoverComponents()">Discover</button>
+    </div>
+    <div class="chips" id="component-chips"></div>
+    <p class="muted" id="components-msg"></p>
+  </div>
+
+  <div class="panel">
+    <h2>2 · List a component's elements</h2>
+    <div class="row">
+      <input type="text" id="component-input" placeholder="e.g. WifiCtrl" value="WifiCtrl">
+      <button onclick="loadElements()">List elements</button>
+      <button class="secondary" onclick="getSelected()">Get selected</button>
+      <span class="muted" id="element-count"></span>
+    </div>
+    <div class="row filter-row" style="margin-top:10px;">
+      <input type="text" id="filter-input" placeholder="filter by substring…" oninput="renderElements()">
+    </div>
+    <div id="elements-wrap">
+      <table>
+        <thead><tr><th style="width:26px;"></th><th>Name</th><th style="width:110px;">Kind</th><th style="width:120px;">Actions</th></tr></thead>
+        <tbody id="elements-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" id="result-panel">
+    <h2>Result</h2>
+    <pre id="result-pre">// Get or Invoke something above to see it here.</pre>
+  </div>
+
+</main>
+
+<div id="invoke-modal-bg">
+  <div id="invoke-modal">
+    <h3 id="invoke-modal-title"></h3>
+    <p class="muted">Params as a flat JSON object (strings/numbers/booleans). Leave empty <code>{}</code> for a no-arg method.</p>
+    <textarea id="invoke-params">{}</textarea>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeInvokeModal()">Cancel</button>
+      <button onclick="submitInvoke()">Invoke</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/api/v1/rbus';
+let currentElements = [];
+let invokeTarget = null;
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let body;
+  try { body = await res.json(); } catch (e) { body = { error: 'Non-JSON response (HTTP ' + res.status + ')' }; }
+  return body;
+}
+
+function showResult(obj) {
+  document.getElementById('result-pre').textContent = JSON.stringify(obj, null, 2);
+}
+
+async function refreshStatus() {
+  const badge = document.getElementById('status-badge');
+  try {
+    const s = await api(API + '/status');
+    if (s.connected) {
+      badge.textContent = 'connected (' + s.component + ')';
+      badge.className = 'badge-ok';
+    } else {
+      badge.textContent = 'disconnected — ' + (s.error || 'unknown error');
+      badge.className = 'badge-bad';
+    }
+  } catch (e) {
+    badge.textContent = 'unreachable';
+    badge.className = 'badge-bad';
+  }
+}
+
+async function discoverComponents() {
+  const path = document.getElementById('path-input').value.trim();
+  const msg = document.getElementById('components-msg');
+  const chipsEl = document.getElementById('component-chips');
+  chipsEl.innerHTML = '';
+  msg.textContent = 'Discovering…';
+  msg.className = 'muted';
+  const res = await api(API + '/components?path=' + encodeURIComponent(path));
+  if (res.error) {
+    msg.textContent = res.error;
+    msg.className = 'muted err-text';
+    return;
+  }
+  const comps = res.components || [];
+  if (comps.length === 0) {
+    msg.textContent = 'No components own this path.';
+    return;
+  }
+  msg.textContent = comps.length + ' component(s) own this path — click one to list its elements.';
+  comps.forEach(c => {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.textContent = c;
+    chip.onclick = () => { document.getElementById('component-input').value = c; loadElements(); };
+    chipsEl.appendChild(chip);
+  });
+}
+
+async function loadElements() {
+  const component = document.getElementById('component-input').value.trim();
+  const countEl = document.getElementById('element-count');
+  countEl.textContent = 'Loading…';
+  const res = await api(API + '/elements?component=' + encodeURIComponent(component));
+  if (res.error) {
+    countEl.textContent = res.error;
+    currentElements = [];
+    renderElements();
+    return;
+  }
+  currentElements = res.elements || [];
+  countEl.textContent = currentElements.length + ' elements';
+  renderElements();
+}
+
+function renderElements() {
+  const filter = document.getElementById('filter-input').value.trim().toLowerCase();
+  const body = document.getElementById('elements-body');
+  body.innerHTML = '';
+  const filtered = filter
+    ? currentElements.filter(e => e.name.toLowerCase().includes(filter))
+    : currentElements;
+
+  filtered.forEach(e => {
+    const tr = document.createElement('tr');
+
+    const tdCheck = document.createElement('td');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'elrow';
+    cb.value = e.name;
+    tdCheck.appendChild(cb);
+
+    const tdName = document.createElement('td');
+    tdName.textContent = e.name;
+
+    const tdKind = document.createElement('td');
+    const kindSpan = document.createElement('span');
+    kindSpan.className = 'kind kind-' + e.kind;
+    kindSpan.textContent = e.kind;
+    tdKind.appendChild(kindSpan);
+
+    const tdActions = document.createElement('td');
+    tdActions.className = 'actions';
+    const getBtn = document.createElement('button');
+    getBtn.className = 'small secondary';
+    getBtn.textContent = 'Get';
+    getBtn.onclick = () => getOne(e.name);
+    const invokeBtn = document.createElement('button');
+    invokeBtn.className = 'small';
+    invokeBtn.textContent = 'Invoke';
+    invokeBtn.onclick = () => openInvokeModal(e.name);
+    tdActions.appendChild(getBtn);
+    tdActions.appendChild(invokeBtn);
+
+    tr.appendChild(tdCheck);
+    tr.appendChild(tdName);
+    tr.appendChild(tdKind);
+    tr.appendChild(tdActions);
+    body.appendChild(tr);
+  });
+}
+
+async function getOne(name) {
+  showResult({ status: 'loading…' });
+  const res = await api(API + '/get', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths: [name] })
+  });
+  showResult(res);
+}
+
+async function getSelected() {
+  const boxes = Array.from(document.querySelectorAll('.elrow:checked')).map(cb => cb.value);
+  if (boxes.length === 0) { showResult({ error: 'No elements selected (check the boxes on the left).' }); return; }
+  showResult({ status: 'loading…' });
+  const res = await api(API + '/get', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths: boxes })
+  });
+  showResult(res);
+}
+
+function openInvokeModal(name) {
+  invokeTarget = name;
+  document.getElementById('invoke-modal-title').textContent = name;
+  document.getElementById('invoke-params').value = '{}';
+  document.getElementById('invoke-modal-bg').style.display = 'flex';
+}
+function closeInvokeModal() {
+  document.getElementById('invoke-modal-bg').style.display = 'none';
+  invokeTarget = null;
+}
+async function submitInvoke() {
+  let params;
+  try {
+    params = JSON.parse(document.getElementById('invoke-params').value || '{}');
+  } catch (e) {
+    alert('Params must be valid JSON.');
+    return;
+  }
+  const method = invokeTarget;
+  closeInvokeModal();
+  showResult({ status: 'invoking ' + method + '…' });
+  const res = await api(API + '/method/invoke', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ method, params })
+  });
+  showResult(res);
+}
+
+refreshStatus();
+setInterval(refreshStatus, 10000);
+discoverComponents();
+</script>
+
+</body>
+</html>

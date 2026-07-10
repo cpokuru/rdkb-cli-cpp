@@ -73,6 +73,22 @@ MHD_Result handle_post_unblock_client(struct MHD_Connection*, const std::string&
 // settings, floor plans, and performance history defaults.
 void init_wireless_and_coverage_defaults();
 
+// rbus explorer (generic debug/inspection endpoints — see rbus_bridge.h)
+MHD_Result handle_get_rbus_status(struct MHD_Connection*);
+MHD_Result handle_get_rbus_components(struct MHD_Connection*, const std::string& path);
+MHD_Result handle_get_rbus_elements(struct MHD_Connection*, const std::string& component);
+MHD_Result handle_post_rbus_get(struct MHD_Connection*, const std::string& body);
+MHD_Result handle_post_rbus_method_invoke(struct MHD_Connection*, const std::string& body);
+
 // Periodic background task (10s cadence) that appends metric history points
 // and raises/expires alarms — mirrors updatePerformanceHistory() in main.go.
 void start_performance_background_task();
+
+// Periodic background task (10s cadence) that refreshes AppState's
+// devices/clients from the real TR-181 data model via rbus (see
+// rbus_datamodel_bridge.cpp) — replaces the old sample_data.cpp hardcoded
+// values as the live source, per the full-replace-exec()-with-rbus
+// decision. Every handler that reads AppState.devices/clients (performance
+// tracking, metrics, health score, WS broadcasts) keeps working unchanged,
+// just backed by real data now instead of static fixtures.
+void start_rbus_refresh_task();
