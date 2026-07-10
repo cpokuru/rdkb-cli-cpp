@@ -54,7 +54,73 @@ simultaneously on `:8888` in the same test run, including REST calls still
 working correctly *while* a WS connection is active — under
 AddressSanitizer, no memory errors.
 
-## Live deployment finding #3: devices/clients keyed on an empty TR-181 field (real bug, now fixed)
+## Wireless Settings → Radio Configuration migrated to rbus
+
+Same approach as topology/devices/clients: `Device.WiFi.DataElements.
+Network.Topology` already carries per-radio `Band`/`Channel`/`Class`/
+`Enabled` data (confirmed in your real dump: `"ID": "02:02:10:b6:52:1c",
+"Enabled": true, "Band": 0, "Class": 32, "Channel": 6`), so
+`get_radios()` derives from the *same already-verified* Topology fetch
+rather than guessing whether this rbus build supports the multi-level
+wildcard query (`Device.*.Radio.*.CurrentOperatingClasses.*.Class`) that
+would otherwise be needed — no evidence either way was available, so this
+was the safer path. **Verified against your actual real Topology dump**
+(saved as a fixture and fed through the real code path): correctly
+produced all three bands with the exact real channel/class values
+(2.4GHz/ch6/class32, 5GHz/ch36/class128, 6GHz/ch1/class134) and real
+radio IDs.
+
+One real limitation, not a bug: per-channel *capabilities* (supported
+operating classes, max TX power) aren't in the Topology blob, so
+`RadioConfig.device_list[].supported_class` stays empty — only the
+current/selected channel is real data now. If
+`Radio.{i}.Capabilities.OperatingClasses.*` turns out reachable via rbus
+(these elements exist in the schema per `discelements`, just unconfirmed
+whether they're gettable), wire that in for capability display.
+
+`PUT /wireless/radios/{band}` (local override) and `POST
+/wireless/radios` (the actual channel-change write) stay as they were —
+the PUT was already AppState-only, and the POST still goes through
+`em::exec_cmd`/`em::update_anticipated_channel_preference` since there's
+no confirmed rbus SET path for channel preference.
+
+## Remaining sections: still exec()/TLS-backed, need TR-181 path discovery
+
+**Wireless Settings → Advanced/Scan**: already local-state-only (not
+broken, just not live-radio-backed) — these never called `exec()` at all,
+so nothing to migrate yet; they'd need `SteeringPolicy`/
+`RCPISteeringThreshold`/`ChannelUtilizationThreshold` (confirmed present
+per-radio in `discelements`, elements 585-591) wired in if you want real
+current steering state instead of the current AppState defaults.
+
+**Policy Settings** (`wifipolicy`): **zero** policy-related TR-181
+elements appeared anywhere in the `discelements WifiCtrl`/
+`discelements tr_181_service` dumps provided so far. No path to migrate
+without more discovery — possibly under a different rbus component
+entirely (policy/QoS-related components in RDK are sometimes separate
+from the WiFi data-elements provider). Worth running
+`rbuscli discallcomponents` or searching the explorer
+(`/api/v1/rbus/elements` with different component names) for anything
+with "Policy"/"QoS"/"Steering" in the path.
+
+**System Settings → Wi-Fi Reset** (`wifireset`): same situation — no
+`Reset`-related TR-181 element found in what's been discovered.
+`em_cli.cpp`'s standalone `get_reset_tree(platform)` function exists (see
+the earlier "Verified against the real library source" section) but its
+relationship to the web dashboard's reset flow specifically hasn't been
+confirmed, so this stays on `exec("get_reset ...")` until there's
+concrete evidence either way.
+
+**How to find the missing paths**: the `rbus_explorer.html` tool deployed
+alongside the dashboard (`/api/v1/rbus/elements` with a component name)
+is exactly for this — faster than SSH + `rbuscli` each time. Try it
+against components other than `WifiCtrl`/`tr_181_service` for policy/reset
+— whatever turns up, the same pattern used for topology/devices/radios
+(verify the real path and shape, write a typed getter in
+`rbus_datamodel_bridge.cpp`, wire it into the existing handler) applies
+directly.
+
+
 
 With the truncation bug fixed, the topology diagram rendered correctly
 (real haul types, real client MACs) — but the Mesh Devices card showed

@@ -74,19 +74,29 @@ bool cj_bool(cJSON* obj, const char* key) {
 }
 
 struct RadioBssInfo {
+    std::string device_id;
+    std::string radio_id;
     int band = 0;
+    int channel = 0;
+    int op_class = 0;
+    bool enabled = false;
     std::vector<TopoBSS> bss;
     std::vector<TopoSTA> stas;
 };
 
-std::vector<RadioBssInfo> parse_radio_list(cJSON* radio_list) {
+std::vector<RadioBssInfo> parse_radio_list(cJSON* radio_list, const std::string& device_id) {
     std::vector<RadioBssInfo> radios;
     if (!radio_list || !cJSON_IsArray(radio_list)) return radios;
 
     cJSON* radio = nullptr;
     cJSON_ArrayForEach(radio, radio_list) {
         RadioBssInfo r;
+        r.device_id = device_id;
+        r.radio_id = cj_str(radio, "ID");
         r.band = cj_int(radio, "Band");
+        r.channel = cj_int(radio, "Channel");
+        r.op_class = cj_int(radio, "Class");
+        r.enabled = cj_bool(radio, "Enabled");
 
         cJSON* bss_list = cJSON_GetObjectItem(radio, "BSSList");
         if (bss_list && cJSON_IsArray(bss_list)) {
@@ -169,7 +179,7 @@ void traverse(cJSON* device, float parent_x, float parent_y, double angle, int d
     cJSON* backhaul = cJSON_GetObjectItem(device, "Backhaul");
     if (!backhaul) return;
 
-    auto radios = parse_radio_list(cJSON_GetObjectItem(device, "RadioList"));
+    auto radios = parse_radio_list(cJSON_GetObjectItem(device, "RadioList"), device_id);
     std::vector<TopoSTA> stas;
     for (auto& r : radios) stas.insert(stas.end(), r.stas.begin(), r.stas.end());
     auto haul_types = build_haul_types(radios);
@@ -410,6 +420,72 @@ std::vector<HaulConfig> get_wireless_profiles() {
     }
     for (auto& [key, cfg] : grouped) profiles.push_back(cfg);
     return profiles;
+}
+
+std::vector<RadioConfig> get_radios() {
+    std::vector<RadioConfig> radios;
+    std::string topo_json = get_single_value("Device.WiFi.DataElements.Network.Topology");
+    if (topo_json.empty()) return radios;
+
+    cJSON* root = cJSON_Parse(topo_json.c_str());
+    if (!root) return radios;
+
+    static const std::vector<std::pair<int, std::string>> band_labels = {
+        {0, "2.4GHz"}, {1, "5GHz"}, {3, "6GHz"}
+    };
+
+    // Flat walk collecting every radio across every device in the mesh
+    // (not just the root), same recursive-Child pattern as get_clients().
+    std::vector<RadioBssInfo> all_radios;
+    std::function<void(cJSON*)> walk = [&](cJSON* device) {
+        if (!device) return;
+        std::string device_id = cj_str(device, "ID");
+        auto radios_here = parse_radio_list(cJSON_GetObjectItem(device, "RadioList"), device_id);
+        all_radios.insert(all_radios.end(), radios_here.begin(), radios_here.end());
+
+        cJSON* backhaul = cJSON_GetObjectItem(device, "Backhaul");
+        if (backhaul) {
+            cJSON* child_list = cJSON_GetObjectItem(backhaul, "Child");
+            if (child_list && cJSON_IsArray(child_list)) {
+                cJSON* child = nullptr;
+                cJSON_ArrayForEach(child, child_list) walk(child);
+            }
+        }
+    };
+    walk(cJSON_GetObjectItem(root, "Device"));
+    cJSON_Delete(root);
+
+    // Group by band, one WifiChannelConfig per device within that band —
+    // matches the shape handle_get_radios() already builds from the
+    // exec()-based path, so the frontend needs no changes.
+    for (auto& [band_num, band_label] : band_labels) {
+        RadioConfig rc;
+        rc.band = band_label;
+
+        std::map<std::string, WifiChannelConfig> by_device;
+        bool any_in_band = false;
+        for (auto& r : all_radios) {
+            if (r.band != band_num) continue;
+            any_in_band = true;
+            rc.enabled = rc.enabled || r.enabled;
+            if (r.channel != 0) rc.channel = r.channel; // last-write, real devices should agree
+
+            auto& wc = by_device[r.device_id];
+            wc.device_id = r.device_id;
+            ChannelConfigEntry entry;
+            entry.device_id = r.device_id;
+            entry.radio_id = r.radio_id;
+            entry.radio_index = band_num;
+            entry.cls = r.op_class;
+            entry.channels = { r.channel };
+            wc.selected_config.push_back(entry);
+        }
+        if (!any_in_band) continue;
+
+        for (auto& [dev_id, wc] : by_device) rc.device_list.push_back(wc);
+        radios.push_back(rc);
+    }
+    return radios;
 }
 
 } // namespace em_rbus

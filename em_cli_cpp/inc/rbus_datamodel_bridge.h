@@ -60,4 +60,18 @@ std::vector<Device> get_devices();
 // an empty PassPhrase as "unchanged / not shown", not "cleared".
 std::vector<HaulConfig> get_wireless_profiles();
 
+// Device.WiFi.DataElements.Network.Topology already carries per-radio
+// Band/Channel/Class/Enabled data (confirmed in a real dump: "ID":
+// "02:02:10:b6:52:1c", "Enabled": true, "Band": 0, "Class": 32,
+// "Channel": 6) — derived from the same already-verified Topology fetch
+// used by get_topology()/get_clients(), rather than a separate multi-level
+// wildcard query (Device.*.Radio.*.CurrentOperatingClasses.*.Class) with
+// no confirmed evidence rbus supports nesting wildcards that deep on this
+// build. NOTE: per-channel *capabilities* (supported operating classes,
+// max TX power) are NOT in the Topology blob, so RadioConfig.device_list's
+// supported_class stays empty here — only the current/selected config is
+// real. If Radio.{i}.Capabilities.OperatingClasses.* turns out reachable
+// via rbus later (verify with the explorer), wire that in for capabilities.
+std::vector<RadioConfig> get_radios();
+
 } // namespace em_rbus

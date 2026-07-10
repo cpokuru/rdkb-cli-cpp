@@ -3,6 +3,7 @@
 #include "app_state.h"
 #include "json_helpers.h"
 #include "em_cli_bridge.h"
+#include "rbus_datamodel_bridge.h"
 #include "ws_server.h"
 #include <cstring>
 #include <random>
@@ -24,38 +25,12 @@ static void broadcast_wireless_update(const std::string& subtype, cJSON* data_ow
 // (updateAnticipatedChannelPreference + applyChannelConfig).
 
 MHD_Result handle_get_radios(struct MHD_Connection* connection) {
-    em_network_node_t* prev_config_tree = em::exec_cmd("get_channel OneWifiMesh 1");
-    em_network_node_t* channel_tree = em::exec_cmd("get_channel OneWifiMesh 3");
-    if (!channel_tree) {
-        CJsonPtr err(cJSON_CreateObject());
-        add_str(err.get(), "error", "Failed to fetch channel tree");
-        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, to_json_string(err.get()));
-    }
-
-    em_network_node_t* device_list_tree = em::get_child(channel_tree, "DeviceList");
-    auto capability_map = em::get_channel_capability_from_tree(device_list_tree);
-    auto prev_config_map = em::get_configured_channels(prev_config_tree);
-
-    static const std::vector<std::pair<int, std::string>> band_labels = {
-        {0, "2.4GHz"}, {1, "5GHz"}, {3, "6GHz"}
-    };
+    auto radios = em_rbus::get_radios();
 
     CJsonPtr root(cJSON_CreateObject());
-    cJSON* radios = cJSON_CreateArray();
-    for (auto& [band, class_map] : capability_map) {
-        RadioConfig band_entry;
-        for (auto& [label_band, label] : band_labels) if (label_band == band) band_entry.band = label;
-
-        for (auto& dev_prev : prev_config_map) {
-            WifiChannelConfig wc;
-            wc.device_id = dev_prev.device_id;
-            wc.supported_class = class_map;
-            for (auto& cfg : dev_prev.selected_config) if (cfg.radio_index == band) wc.selected_config.push_back(cfg);
-            band_entry.device_list.push_back(wc);
-        }
-        cJSON_AddItemToArray(radios, radio_config_to_json(band_entry));
-    }
-    cJSON_AddItemToObject(root.get(), "radios", radios);
+    cJSON* arr = cJSON_CreateArray();
+    for (auto& rc : radios) cJSON_AddItemToArray(arr, radio_config_to_json(rc));
+    cJSON_AddItemToObject(root.get(), "radios", arr);
     add_str(root.get(), "timestamp", epoch_to_rfc3339(now_epoch()));
 
     return send_json(connection, MHD_HTTP_OK, to_json_string(root.get()));
