@@ -316,7 +316,18 @@ std::vector<Client> get_clients() {
 std::vector<Device> get_devices() {
     std::vector<Device> devices;
 
-    // Metadata table (not present in the Topology blob).
+    // Metadata table (Manufacturer/SerialNumber/ManufacturerModel/
+    // SoftwareVersion) — best-effort enrichment only. NOT used as the
+    // primary key: on the real gateway, Device.{i}.ID in this table comes
+    // back empty (confirmed via a real dmcli dump — every Device.{i}.ID
+    // parameter had a blank value), which previously made every derived
+    // Device end up with an empty .mac, breaking the topology cross-
+    // reference AND the frontend's client-side "which AP is this client
+    // on" lookup (both keyed on device MAC). Devices now come from
+    // get_topology() instead, which has real IDs (proven working — the
+    // topology diagram already renders correctly with real haul types and
+    // client MACs). This metadata table is joined back in by table index
+    // position only, on a best-effort basis.
     auto manufacturer = get_wildcard_column(
         "Device.WiFi.DataElements.Network.Device.*.Manufacturer",
         "Device.WiFi.DataElements.Network.Device.");
@@ -329,35 +340,35 @@ std::vector<Device> get_devices() {
     auto sw_version = get_wildcard_column(
         "Device.WiFi.DataElements.Network.Device.*.SoftwareVersion",
         "Device.WiFi.DataElements.Network.Device.");
-    auto id_col = get_wildcard_column(
-        "Device.WiFi.DataElements.Network.Device.*.ID",
-        "Device.WiFi.DataElements.Network.Device.");
 
-    // Cross-reference against the topology tree for status/role — the
-    // metadata table alone doesn't carry backhaul type, so "is this a
-    // Controller/Agent/Extender" comes from the same traversal as
-    // get_topology().
     TopologyResult topo = get_topology();
+    std::vector<Client> clients = get_clients(); // for per-device active_clients count
 
-    for (auto& [idx, id] : id_col) {
+    int idx = 1; // TR-181 table indices are 1-based
+    for (auto& node : topo.nodes) {
         Device d;
-        d.mac = id;
-        d.vendor = manufacturer.count(idx) ? manufacturer[idx] : "";
-        d.model = model.count(idx) ? model[idx] : "";
-        d.capabilities.serial_number = serial.count(idx) ? serial[idx] : "";
-        d.capabilities.firmware = sw_version.count(idx) ? sw_version[idx] : "";
-        d.status = "Online"; // TR-181 doesn't expose an offline state for
-                              // topology-present devices; absence from the
-                              // tree is the only "offline" signal available.
+        d.mac = node.id;
+        d.role = (node.name == "Controller") ? "Controller" : "Agent";
+        d.status = "Online"; // presence in the live topology tree is the
+                              // only "online" signal available over rbus
         d.last_seen = now_epoch();
 
-        for (auto& node : topo.nodes) {
-            if (node.id == id) {
-                d.role = (node.name == "Controller") ? "Controller" : "Agent";
-                break;
-            }
-        }
+        // Best-effort metadata join by position — real vendor/model data
+        // if the table happens to align, empty (not "Unknown", just
+        // genuinely blank) otherwise, which the frontend already handles
+        // as a fallback display state.
+        if (manufacturer.count(idx)) d.vendor = manufacturer[idx];
+        if (model.count(idx)) d.model = model[idx];
+        if (serial.count(idx)) d.capabilities.serial_number = serial[idx];
+        if (sw_version.count(idx)) d.capabilities.firmware = sw_version[idx];
+
+        int active_clients = 0;
+        for (auto& c : clients) if (c.connected_ap_mac == node.id) active_clients++;
+        d.metrics.active_clients = active_clients;
+        d.metrics.last_updated = now_epoch();
+
         devices.push_back(d);
+        idx++;
     }
     return devices;
 }

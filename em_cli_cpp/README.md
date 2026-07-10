@@ -54,7 +54,48 @@ simultaneously on `:8888` in the same test run, including REST calls still
 working correctly *while* a WS connection is active — under
 AddressSanitizer, no memory errors.
 
-## Live deployment finding #2: large rbus string values were silently truncated (real bug, now fixed)
+## Live deployment finding #3: devices/clients keyed on an empty TR-181 field (real bug, now fixed)
+
+With the truncation bug fixed, the topology diagram rendered correctly
+(real haul types, real client MACs) — but the Mesh Devices card showed
+blank Role/Uptime and 0 Clients, and Connected Clients showed "Unknown
+Device"/"Unknown AP" for every real client. Root cause, found from your
+own real `dmcli` dump earlier in this conversation:
+`Device.WiFi.DataElements.Network.Device.{i}.ID` comes back **empty** on
+the real gateway ("Parameter 3 name: ...Device.1.ID / value: " — blank).
+`get_devices()` used that empty field as its primary key, so every derived
+`Device` ended up with `mac=""`. That broke two things at once: the
+topology cross-reference (empty string never matches a real ID), and —
+more visibly — the frontend's client-side "which device is this client
+connected to" lookup, which matches `client.connected_ap_mac` against
+`device.mac`. An empty device MAC means that lookup always misses, hence
+"Unknown AP" on every client row even though the client's own MAC and
+connection data were correct the whole time.
+
+Fixed: `get_devices()` now derives from `get_topology()`'s node list
+(proven correct — the diagram already renders real names/haul types from
+it) as the primary source, with the `Device.{i}.Manufacturer/
+SerialNumber/ManufacturerModel/SoftwareVersion` metadata table joined back
+in by table position as best-effort enrichment only, never as the key.
+Also added: per-device `active_clients` count (derived from the same
+topology walk `get_clients()` already does, grouped by
+`connected_ap_mac`), which now populates the "Clients" field on the
+device card.
+
+Verified with a test simulating the exact real bug (metadata `ID` column
+returns nothing, only the Topology tree has real IDs): devices now get
+real MACs, `Agent`'s `active_clients` count matches its actual connected
+STA, and the client's `connected_ap_mac` matches a real device's `.mac`
+exactly — the cross-reference that was silently failing now works.
+
+**Still a genuine data gap, not a bug**: `Uptime` stays "Unknown" and a
+client's hostname stays blank when the real device's own `ClientType`
+field is empty (unfingerprinted clients) — there's no TR-181 path
+discovered yet for device uptime, and synthesizing a fake hostname would
+be worse than an honest blank. If `discelements` turns up an uptime path
+later, wiring it in is a small addition to `get_devices()`.
+
+
 
 Deployed and linking, `/api/v1/rbus/status` showed `connected: true` and the
 raw `/api/v1/rbus/get` explorer endpoint returned real data — but
